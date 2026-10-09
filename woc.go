@@ -30,6 +30,13 @@ const (
 	labelBusyURL    = "woc.busy_url"       // checked before a stop; 200 = busy, don't stop yet. Host may be empty: http://:4100/busy
 	labelWakeEvery  = "woc.wake_every"     // wake the group if it has been asleep this long (a safety net for missed work)
 	labelWakeNotify = "woc.wake_on_notify" // Postgres NOTIFY channel(s) that wake the group (needs WOC_PG_URL)
+
+	// Start order inside a group: compose's own depends_on label, or woc.after for containers
+	// that don't come from compose (container names, comma-separated).
+	labelAfter            = "woc.after"
+	labelComposeDependsOn = "com.docker.compose.depends_on" // "db:service_healthy:false,api:service_started:false"
+	labelComposeService   = "com.docker.compose.service"
+	labelComposeProject   = "com.docker.compose.project"
 )
 
 // member is one container of a group. Members without hosts (an internal API, a worker) start
@@ -39,7 +46,10 @@ type member struct {
 	hosts       []string
 	port        int
 	waitHealthy bool
-	busyURL     string // resolved: the container name filled in when the label leaves the host empty
+	busyURL     string   // resolved: the container name filled in when the label leaves the host empty
+	service     string   // compose project/service, to resolve depends_on
+	after       []string // compose services (project/service) or container names it starts after
+	tcp         []tcpMap // woc.tcp forwards (TCP mode)
 }
 
 // group is the unit that wakes and sleeps.
@@ -56,13 +66,14 @@ type group struct {
 	// sleep waits for the stop and then wakes it again, instead of racing it.
 	op sync.Mutex
 
-	mu       sync.Mutex
-	running  bool      // at least one member running (what the reaper stops)
-	ready    bool      // every member running and healthy: requests go straight through
-	inflight int       // requests (and websockets) being proxied right now
-	lastSeen time.Time // last request start or end
-	wokeAt   time.Time
-	sleptAt  time.Time // when it was last seen asleep after being up (or first seen asleep)
+	mu        sync.Mutex
+	running   bool      // at least one member running (what the reaper stops)
+	ready     bool      // every member running and healthy: requests go straight through
+	inflight  int       // requests (and websockets) being proxied right now
+	lastSeen  time.Time // last request start or end
+	wokeAt    time.Time
+	sleptAt   time.Time // when it was last seen asleep after being up (or first seen asleep)
+	holdUntil time.Time // kept awake until then (woc hold), whatever the traffic
 }
 
 func (g *group) touch(now time.Time) {
@@ -86,15 +97,24 @@ type engine struct {
 	// point it at localhost).
 	addr func(m member) string
 
-	mu     sync.RWMutex
-	groups map[string]*group
-	routes map[string]route // lowercase host → route
+	mu        sync.RWMutex
+	groups    map[string]*group
+	routes    map[string]route // lowercase host → route
+	tcpRoutes map[int]tcpRoute // WOC listen port → container port (TCP mode)
+
+	tcp     tcpListeners
+	tcpBind string                          // address the TCP listeners bind to ("" = all)
+	tcpAddr func(m member, port int) string // where a member's TCP port is (tests use localhost)
+
+	stateFile    string               // where holds are kept across restarts ("" = memory only)
+	pendingHolds map[string]time.Time // restored holds waiting for their group's first sync
 }
 
 func newEngine(d *docker, log *slog.Logger, defIdle time.Duration) *engine {
 	return &engine{d: d, log: log, now: time.Now, defIdle: defIdle, grace: 10 * time.Second,
-		addr:   func(m member) string { return net.JoinHostPort(m.name, strconv.Itoa(m.port)) },
-		groups: map[string]*group{}, routes: map[string]route{}}
+		addr:    func(m member) string { return net.JoinHostPort(m.name, strconv.Itoa(m.port)) },
+		tcpAddr: func(m member, port int) string { return net.JoinHostPort(m.name, strconv.Itoa(port)) },
+		groups:  map[string]*group{}, routes: map[string]route{}, tcpRoutes: map[int]tcpRoute{}}
 }
 
 func parseDur(s string, def time.Duration) time.Duration {
@@ -145,6 +165,23 @@ func (e *engine) sync(ctx context.Context) error {
 			specs[gname] = s
 		}
 		m := member{name: c.Name(), hosts: splitList(l[labelHost]), waitHealthy: strings.TrimSpace(l[labelReady]) == "healthy"}
+		if svc := l[labelComposeService]; svc != "" {
+			m.service = l[labelComposeProject] + "/" + svc
+			for _, dep := range strings.Split(l[labelComposeDependsOn], ",") {
+				if name, _, _ := strings.Cut(strings.TrimSpace(dep), ":"); name != "" {
+					m.after = append(m.after, l[labelComposeProject]+"/"+name)
+				}
+			}
+		}
+		m.after = append(m.after, splitList(l[labelAfter])...)
+		if v := strings.TrimSpace(l[labelTCP]); v != "" {
+			tm, err := parseTCP(v)
+			if err != nil {
+				e.log.Warn("invalid woc.tcp, ignored", "container", m.name, "err", err)
+			} else {
+				m.tcp = tm
+			}
+		}
 		if v := strings.TrimSpace(l[labelBusyURL]); v != "" {
 			u, err := resolveBusyURL(v, m.name)
 			if err != nil {
@@ -189,6 +226,7 @@ func (e *engine) sync(ctx context.Context) error {
 	now := e.now()
 	groups := map[string]*group{}
 	routes := map[string]route{}
+	tcpRoutes := map[int]tcpRoute{}
 	for name, s := range specs {
 		g := e.groups[name]
 		if g == nil {
@@ -225,10 +263,25 @@ func (e *engine) sync(ctx context.Context) error {
 				}
 				routes[h] = route{group: g, target: e.addr(m)}
 			}
+			for _, t := range m.tcp {
+				if prev, dup := tcpRoutes[t.listen]; dup {
+					e.log.Warn("duplicate woc.tcp port, keeping the first", "port", t.listen, "group", prev.group.name, "ignored", name)
+					continue
+				}
+				tcpRoutes[t.listen] = tcpRoute{group: g, member: m, target: t.target}
+			}
 		}
 	}
-	e.groups, e.routes = groups, routes
+	e.groups, e.routes, e.tcpRoutes = groups, routes, tcpRoutes
 	return nil
+}
+
+// refresh is one sync cycle: labels and states from Docker, restored holds, TCP listeners.
+func (e *engine) refresh(ctx context.Context) error {
+	err := e.sync(ctx)
+	e.applyPendingHolds()
+	e.syncListeners(ctx)
+	return err
 }
 
 func splitMiddlewares(s string) []string {
@@ -305,22 +358,26 @@ func (e *engine) wake(ctx context.Context, g *group) error {
 	t0 := e.now()
 	ctx, cancel := context.WithTimeout(ctx, g.startTimeout)
 	defer cancel()
+	// Tier by tier: a database before the API that needs it, the API before the web app. Each
+	// tier is started together and must be ready before the next one starts.
 	started := 0
-	for _, m := range g.members {
-		st, err := e.d.inspect(ctx, m.name)
-		if err != nil {
-			return err
-		}
-		if !st.Running {
-			if err := e.d.start(ctx, m.name); err != nil {
+	for _, tier := range startTiers(g.members) {
+		for _, m := range tier {
+			st, err := e.d.inspect(ctx, m.name)
+			if err != nil {
 				return err
 			}
-			started++
+			if !st.Running {
+				if err := e.d.start(ctx, m.name); err != nil {
+					return err
+				}
+				started++
+			}
 		}
-	}
-	for _, m := range g.members {
-		if err := e.waitReady(ctx, m); err != nil {
-			return err
+		for _, m := range tier {
+			if err := e.waitReady(ctx, m); err != nil {
+				return err
+			}
 		}
 	}
 	now := e.now()
@@ -345,10 +402,22 @@ func (e *engine) waitReady(ctx context.Context, m member) error {
 	defer tick.Stop()
 	for {
 		var ok bool
-		if m.port > 0 && !m.waitHealthy {
+		switch {
+		case len(m.tcp) > 0:
+			// TCP mode: a database opens its port before it accepts queries ("the database system
+			// is starting up"), so wait for its healthcheck too when it has one.
+			if st, err := e.d.inspect(ctx, m.name); err == nil && st.ready() {
+				ok = true
+				for _, t := range m.tcp {
+					ok = ok && dialOK(ctx, e.tcpAddr(m, t.target))
+				}
+			}
+		case m.port > 0 && !m.waitHealthy:
 			ok = dialOK(ctx, e.addr(m))
-		} else if st, err := e.d.inspect(ctx, m.name); err == nil {
-			ok = st.ready() && (m.port == 0 || dialOK(ctx, e.addr(m)))
+		default:
+			if st, err := e.d.inspect(ctx, m.name); err == nil {
+				ok = st.ready() && (m.port == 0 || dialOK(ctx, e.addr(m)))
+			}
 		}
 		if ok {
 			return nil
@@ -400,7 +469,7 @@ func (e *engine) reapOne(ctx context.Context, g *group) {
 	now := e.now()
 	g.mu.Lock()
 	idleFor := now.Sub(g.lastSeen)
-	if !g.running || g.inflight > 0 || idleFor < g.idle { // a request arrived during the checks
+	if !g.running || g.inflight > 0 || g.held(now) || idleFor < g.idle { // a request arrived during the checks
 		g.mu.Unlock()
 		return
 	}
@@ -418,7 +487,8 @@ func (e *engine) reapOne(ctx context.Context, g *group) {
 func (e *engine) idleNow(g *group) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.running && g.inflight == 0 && e.now().Sub(g.lastSeen) >= g.idle
+	now := e.now()
+	return g.running && g.inflight == 0 && !g.held(now) && now.Sub(g.lastSeen) >= g.idle
 }
 
 // busy asks a member whether it is in the middle of work: 200 means yes. Anything else, a
@@ -519,16 +589,17 @@ func validChannel(s string) bool {
 }
 
 type groupStatus struct {
-	Group    string   `json:"group"`
-	Members  []string `json:"members"`
-	Hosts    []string `json:"hosts"`
-	Running  bool     `json:"running"`
-	Ready    bool     `json:"ready"`
-	Inflight int      `json:"inflight"`
-	Idle     string   `json:"idle"`
-	IdleFor  string   `json:"idle_for"`
-	SleepsIn string   `json:"sleeps_in,omitempty"`
-	WokeAt   string   `json:"woke_at,omitempty"`
+	Group     string   `json:"group"`
+	Members   []string `json:"members"`
+	Hosts     []string `json:"hosts"`
+	Running   bool     `json:"running"`
+	Ready     bool     `json:"ready"`
+	Inflight  int      `json:"inflight"`
+	Idle      string   `json:"idle"`
+	IdleFor   string   `json:"idle_for"`
+	SleepsIn  string   `json:"sleeps_in,omitempty"`
+	HeldUntil string   `json:"held_until,omitempty"`
+	WokeAt    string   `json:"woke_at,omitempty"`
 }
 
 func (e *engine) status() []groupStatus {
@@ -548,6 +619,9 @@ func (e *engine) status() []groupStatus {
 		if g.running && g.inflight == 0 {
 			s.SleepsIn = max(0, g.idle-now.Sub(g.lastSeen)).Round(time.Second).String()
 		}
+		if g.held(now) {
+			s.HeldUntil = g.holdUntil.UTC().Format(time.RFC3339)
+		}
 		if !g.wokeAt.IsZero() {
 			s.WokeAt = g.wokeAt.UTC().Format(time.RFC3339)
 		}
@@ -556,4 +630,66 @@ func (e *engine) status() []groupStatus {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Group < out[j].Group })
 	return out
+}
+
+// startTiers orders a group's members by their start dependencies (compose depends_on,
+// woc.after): tier 0 depends on nothing in the group, tier 1 only on tier 0, and so on.
+// Dependencies outside the group are ignored, and so is a cycle: whatever is left over starts in
+// a last tier together.
+func startTiers(members []member) [][]member {
+	key := func(m member) []string {
+		if m.service != "" {
+			return []string{m.service, m.name}
+		}
+		return []string{m.name}
+	}
+	inGroup := map[string]int{}
+	for i, m := range members {
+		for _, k := range key(m) {
+			inGroup[k] = i
+		}
+	}
+	deps := make([]map[int]bool, len(members))
+	for i, m := range members {
+		deps[i] = map[int]bool{}
+		for _, a := range m.after {
+			if j, ok := inGroup[a]; ok && j != i {
+				deps[i][j] = true
+			}
+		}
+	}
+	placed := map[int]bool{}
+	var tiers [][]member
+	for len(placed) < len(members) {
+		var tier []int
+		for i := range members {
+			if placed[i] {
+				continue
+			}
+			ready := true
+			for j := range deps[i] {
+				if !placed[j] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				tier = append(tier, i)
+			}
+		}
+		if len(tier) == 0 { // a cycle: start the rest together
+			for i := range members {
+				if !placed[i] {
+					tier = append(tier, i)
+				}
+			}
+		}
+		t := make([]member, 0, len(tier))
+		for _, i := range tier {
+			placed[i] = true
+			t = append(t, members[i])
+		}
+		tiers = append(tiers, t)
+	}
+	return tiers
 }

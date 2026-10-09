@@ -35,6 +35,7 @@ type config struct {
 	brand                    string // waiting page footer: whose system this is
 	adminToken               string // if set, POST /wake needs "Authorization: Bearer <token>"
 	pgURL                    string // Postgres to LISTEN on for woc.wake_on_notify ("" = off)
+	stateFile                string // holds survive restarts here ("" = memory only)
 	defaultIdle              time.Duration
 	syncEvery, reapEvery     time.Duration
 	pageAfter                time.Duration // a browser waits this long before getting the "starting" page
@@ -60,6 +61,7 @@ func loadConfig() config {
 		brand:        env("WOC_BRAND", "Wake On Call"),
 		adminToken:   os.Getenv("WOC_ADMIN_TOKEN"),
 		pgURL:        os.Getenv("WOC_PG_URL"),
+		stateFile:    os.Getenv("WOC_STATE_FILE"),
 		defaultIdle:  parseDur(os.Getenv("WOC_DEFAULT_IDLE"), 30*time.Minute),
 		syncEvery:    parseDur(os.Getenv("WOC_SYNC_EVERY"), 5*time.Second),
 		reapEvery:    parseDur(os.Getenv("WOC_REAP_EVERY"), 15*time.Second),
@@ -68,6 +70,9 @@ func loadConfig() config {
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "hold" || os.Args[1] == "release") {
+		os.Exit(runHoldCommand(os.Args[1:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" { // for the image's HEALTHCHECK (no curl in it)
 		resp, err := http.Get("http://127.0.0.1" + env("WOC_ADMIN_LISTEN", ":8081") + "/healthz")
 		if err != nil || resp.StatusCode != http.StatusOK {
@@ -83,14 +88,16 @@ func main() {
 		os.Exit(1)
 	}
 	e := newEngine(d, log, cfg.defaultIdle)
+	e.stateFile = cfg.stateFile
+	e.loadHolds()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := e.sync(ctx); err != nil {
+	if err := e.refresh(ctx); err != nil {
 		log.Warn("first sync failed, will retry", "err", err)
 	}
 	go every(ctx, cfg.syncEvery, func() {
-		if err := e.sync(ctx); err != nil {
+		if err := e.refresh(ctx); err != nil {
 			log.Warn("sync", "err", err)
 		}
 	})
@@ -115,6 +122,7 @@ func main() {
 	defer cancel()
 	_ = proxy.Shutdown(sctx)
 	_ = admin.Shutdown(sctx)
+	e.closeListeners()
 }
 
 // hostname is the default node name. In a container that's its short id, so set WOC_NODE to the
@@ -263,6 +271,45 @@ func (e *engine) adminHandler(cfg config) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		w.WriteHeader(http.StatusOK)
+	})
+	// POST /hold/{group}?for=3h: wake the group and keep it awake that long (backups).
+	// DELETE /hold/{group}: release it; it then sleeps on its normal idle rules.
+	mux.HandleFunc("POST /hold/{group}", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.adminToken != "" && !tokenOK(r.Header.Get("Authorization"), cfg.adminToken) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		g, ok := e.groupByName(r.PathValue("group"))
+		if !ok {
+			http.Error(w, "no such group", http.StatusNotFound)
+			return
+		}
+		d, err := time.ParseDuration(r.URL.Query().Get("for"))
+		if err != nil || d <= 0 || d > 24*time.Hour {
+			http.Error(w, "for must be a duration up to 24h", http.StatusBadRequest)
+			return
+		}
+		e.hold(g, d)
+		if err := e.wake(r.Context(), g); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		e.log.Info("held", "group", g.name, "for", d.String())
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("DELETE /hold/{group}", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.adminToken != "" && !tokenOK(r.Header.Get("Authorization"), cfg.adminToken) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		g, ok := e.groupByName(r.PathValue("group"))
+		if !ok {
+			http.Error(w, "no such group", http.StatusNotFound)
+			return
+		}
+		e.hold(g, 0)
+		e.log.Info("released", "group", g.name)
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("GET /traefik", func(w http.ResponseWriter, r *http.Request) {

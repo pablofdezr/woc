@@ -23,7 +23,8 @@ type fakeDocker struct {
 	cs         map[string]*fakeContainer
 	starts     int
 	stops      int
-	healthyLag int // inspections a started container reports "starting" before "healthy"
+	order      []string // container names in the order they were started
+	healthyLag int      // inspections a started container reports "starting" before "healthy"
 }
 
 type fakeContainer struct {
@@ -75,6 +76,7 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			c.running, c.untilOK = true, f.healthyLag
 			f.starts++
+			f.order = append(f.order, parts[0])
 			w.WriteHeader(http.StatusNoContent)
 		case "stop":
 			c.running = false
@@ -439,5 +441,57 @@ func TestResolveBusyURLAndChannels(t *testing.T) {
 		if validChannel(ch) != ok {
 			t.Errorf("validChannel(%q) != %v", ch, ok)
 		}
+	}
+}
+
+func TestStartTiers(t *testing.T) {
+	names := func(tiers [][]member) string {
+		var out []string
+		for _, tier := range tiers {
+			var n []string
+			for _, m := range tier {
+				n = append(n, m.name)
+			}
+			out = append(out, strings.Join(n, "+"))
+		}
+		return strings.Join(out, " > ")
+	}
+	ms := []member{
+		{name: "app-web-1", service: "app/web", after: []string{"app/api"}},
+		{name: "app-api-1", service: "app/api", after: []string{"app/db", "app/redis"}}, // redis isn't in the group
+		{name: "app-db-1", service: "app/db"},
+	}
+	if got := names(startTiers(ms)); got != "app-db-1 > app-api-1 > app-web-1" {
+		t.Fatalf("compose order: %s", got)
+	}
+	plain := []member{{name: "web", after: []string{"api"}}, {name: "api"}, {name: "cron"}}
+	if got := names(startTiers(plain)); got != "api+cron > web" {
+		t.Fatalf("woc.after order: %s", got)
+	}
+	cycle := []member{{name: "a", after: []string{"b"}}, {name: "b", after: []string{"a"}}, {name: "c"}}
+	if got := names(startTiers(cycle)); got != "c > a+b" {
+		t.Fatalf("cycle: %s", got)
+	}
+}
+
+func TestWakeStartsDependenciesFirst(t *testing.T) {
+	h := newHarness(t, false, map[string]string{labelGroup: "app", labelComposeService: "web", labelComposeProject: "app",
+		labelComposeDependsOn: "db:service_healthy:false"})
+	h.fd.mu.Lock()
+	// The database takes a few healthcheck rounds to become healthy; the web must wait for it.
+	h.fd.cs["db"] = &fakeContainer{hasHealth: true, labels: map[string]string{labelEnable: "true", labelGroup: "app",
+		labelComposeService: "db", labelComposeProject: "app"}}
+	h.fd.healthyLag = 3
+	h.fd.mu.Unlock()
+	if err := h.e.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := h.get("/", ""); rec.Code != 200 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	h.fd.mu.Lock()
+	defer h.fd.mu.Unlock()
+	if strings.Join(h.fd.order, ",") != "db,web" {
+		t.Fatalf("start order %v, want db before web", h.fd.order)
 	}
 }

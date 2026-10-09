@@ -55,6 +55,7 @@ services:
       woc.busy_url: http://:4100/busy # optional: 200 = busy, don't stop it yet
       woc.wake_every: 1h              # optional: wake it after this long asleep
       woc.wake_on_notify: jobs        # optional: Postgres NOTIFY channel(s) that wake it
+      woc.after: api                  # optional: start after these containers (compose depends_on is read on its own)
 ```
 
 Containers without `woc.enable=true` are never touched. A group member without `woc.host`
@@ -63,6 +64,75 @@ Containers without `woc.enable=true` are never touched. A group member without `
 `woc.ready: port` treats the app as ready the moment its port accepts a connection (probed every
 25 ms). Use `woc.ready: healthy` for apps that open their port before they can really serve
 (migrations, cache warm-up): WOC then waits for the container's Docker healthcheck as well.
+
+## Start order
+
+When a group wakes, its containers start in tiers: a container starts only once everything it
+depends on is ready. WOC reads compose's own `depends_on` (Compose stores it on each container),
+so a `db` → `api` → `web` stack wakes in that order with no extra labels. For containers that
+don't come from compose, `woc.after` lists the container names to wait for. Dependencies outside
+the group are ignored, and so is a cycle (whatever is left starts together).
+
+A request is only forwarded once the whole group is ready, so the web app answering first never
+means requests failing because the API or the database aren't up yet.
+
+## Databases and other TCP services
+
+Postgres and Meilisearch don't get their traffic through Traefik: apps connect to them directly.
+TCP mode covers them. `woc.tcp: "6432:5432"` makes WOC listen on its own port 6432 and forward
+to the container's 5432:
+
+```yaml
+services:
+  db:
+    image: postgres:18
+    networks: [data]                  # the network your apps and WOC share
+    healthcheck:                      # WOC waits for it: Postgres opens its port before it accepts queries
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      start_interval: 500ms
+    labels:
+      woc.enable: "true"
+      woc.tcp: "6432:5432"
+      woc.idle: 30m
+```
+
+Apps connect to `woc:6432` instead of `db:5432`. They can't keep using the container's own name:
+a stopped container drops out of Docker's DNS, and giving WOC the same alias would make DNS split
+connections between the two.
+
+- **A connection to a sleeping service waits, it doesn't fail:** WOC starts the container, waits
+  until it is running, healthy if it has a healthcheck, and accepting connections, and then
+  forwards. The client's own connect timeout applies.
+- **An open connection counts as activity**, like a websocket, and WOC never cuts one. The service
+  sleeps once every connection has closed and `woc.idle` has passed, so **connection pools must
+  close idle connections before `woc.idle`** (pgxpool `MaxConnIdleTime`, node-postgres
+  `idleTimeoutMillis`, `database/sql` `SetConnMaxIdleTime`). A pool that holds connections
+  forever keeps the database awake forever, which is safe, just not useful.
+- **Meilisearch works the same way** (`woc.tcp: "7701:7700"`): it's plain HTTP, forwarded as bytes.
+- **Not for everything:** a message broker that clients hold open permanently (NATS) or a cache
+  every request touches (Redis) would never sleep, or would pay a start on every cold request.
+
+## Backups and other jobs: holds
+
+A backup that runs `docker exec db pgbackrest …` from cron fails if the database is asleep.
+A **hold** wakes a group and keeps it awake for a while, whatever the traffic:
+
+```sh
+docker exec woc /woc hold db 3h      # wakes db, waits until ready, keeps it up for at most 3h
+docker exec db pgbackrest --stanza=main backup
+docker exec woc /woc release db      # sleeps again on its last real traffic
+```
+
+Every hold expires on its own (24 h at most), so a job that dies without releasing it costs at
+most its duration. Releasing is not activity: a database woken only for a backup goes back to
+sleep right after it. Holds are the one piece of state WOC keeps across a restart, in
+`WOC_STATE_FILE`, so a long backup never loses its database to a WOC redeploy. The same thing is
+available over HTTP: `POST /hold/<group>?for=3h` and `DELETE /hold/<group>`.
+
+Everything else WOC knows is either in Docker (which containers exist, which run, their labels)
+or cheap to lose: after a restart, running groups get a full idle window from that moment and
+stopped ones wake on their next request.
 
 ## Apps that don't receive HTTP
 
@@ -127,6 +197,7 @@ included. Treat WOC like any other component that can see the Docker API.
 | `WOC_BRAND` | `Wake On Call` | text before the node in the waiting page footer |
 | `WOC_ADMIN_TOKEN` | none | if set, `POST /wake/<group>` needs `Authorization: Bearer <token>` |
 | `WOC_PG_URL` | none | Postgres to LISTEN on for `woc.wake_on_notify` (off when empty) |
+| `WOC_STATE_FILE` | none | where holds are kept across restarts (put it on a volume) |
 
 ## The waiting page
 

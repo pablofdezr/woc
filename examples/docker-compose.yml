@@ -39,11 +39,20 @@ services:
       WOC_DEFAULT_IDLE: 30m
       WOC_NODE: my-server
       WOC_BRAND: Wake On Call
-    networks: [traefik, internal]
+      WOC_STATE_FILE: /data/state.json   # holds survive restarts
+    volumes:
+      - woc-state:/data
+    # traefik: Traefik → WOC → apps. data: apps → WOC → databases (TCP mode).
+    networks: [traefik, data, internal]
     mem_limit: 64m
+
+volumes:
+  woc-state:
 
 networks:
   traefik:
+    external: true
+  data:
     external: true
   internal:
     internal: true
