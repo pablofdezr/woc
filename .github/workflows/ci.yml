@@ -25,6 +25,8 @@ jobs:
       - run: gofmt -l . | (! grep .)
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+      # Visible proof that NOTIFY was tested against the Postgres service, not skipped.
+      - run: go test -count=1 -v -run TestNotifyWakesGroup ./... | tee /dev/stderr | grep -q -- '--- PASS'
       # Docker Hub's token endpoint sometimes answers 504; retry instead of failing the run.
       - name: docker build
         run: |
