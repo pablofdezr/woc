@@ -46,6 +46,7 @@ type member struct {
 	hosts       []string
 	port        int
 	waitHealthy bool
+	readyPG     bool     // woc.ready: postgres — probe the protocol instead of waiting for the healthcheck
 	busyURL     string   // resolved: the container name filled in when the label leaves the host empty
 	service     string   // compose project/service, to resolve depends_on
 	after       []string // compose services (project/service) or container names it starts after
@@ -164,7 +165,8 @@ func (e *engine) sync(ctx context.Context) error {
 			s = &spec{}
 			specs[gname] = s
 		}
-		m := member{name: c.Name(), hosts: splitList(l[labelHost]), waitHealthy: strings.TrimSpace(l[labelReady]) == "healthy"}
+		ready := strings.TrimSpace(l[labelReady])
+		m := member{name: c.Name(), hosts: splitList(l[labelHost]), waitHealthy: ready == "healthy", readyPG: ready == "postgres"}
 		if svc := l[labelComposeService]; svc != "" {
 			m.service = l[labelComposeProject] + "/" + svc
 			for _, dep := range strings.Split(l[labelComposeDependsOn], ",") {
@@ -403,6 +405,14 @@ func (e *engine) waitReady(ctx context.Context, m member) error {
 	for {
 		var ok bool
 		switch {
+		case len(m.tcp) > 0 && m.readyPG:
+			// Postgres speaks for itself, every 25 ms, instead of the healthcheck's start_interval.
+			if st, err := e.d.inspect(ctx, m.name); err == nil && st.Running {
+				ok = true
+				for _, t := range m.tcp {
+					ok = ok && pgReady(ctx, e.tcpAddr(m, t.target))
+				}
+			}
 		case len(m.tcp) > 0:
 			// TCP mode: a database opens its port before it accepts queries ("the database system
 			// is starting up"), so wait for its healthcheck too when it has one.

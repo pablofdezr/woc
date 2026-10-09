@@ -51,7 +51,7 @@ services:
       woc.group: myapp                # optional: containers that wake and sleep together
       woc.middlewares: auth@file      # optional: Traefik middlewares for the router
       woc.start_timeout: 60s          # optional: how long a request waits for the wake
-      woc.ready: port                 # optional: port (default) | healthy
+      woc.ready: port                 # optional: port (default) | healthy | postgres
       woc.busy_url: http://:4100/busy # optional: 200 = busy, don't stop it yet
       woc.wake_every: 1h              # optional: wake it after this long asleep
       woc.wake_on_notify: jobs        # optional: Postgres NOTIFY channel(s) that wake it
@@ -94,8 +94,16 @@ services:
     labels:
       woc.enable: "true"
       woc.tcp: "6432:5432"
+      woc.ready: postgres             # ask Postgres itself, every 25 ms
       woc.idle: 30m
 ```
+
+`woc.ready: postgres` checks readiness at the protocol level: WOC sends a startup message and
+an authentication request back means Postgres is taking connections, while error `57P03` ("the
+database system is starting up") means not yet. It hangs up before authenticating, so it needs no
+credentials. Without it, TCP mode waits for the container's Docker healthcheck, which only re-runs
+every `start_interval`: measured on a 4 vCPU box, Postgres accepted queries about 130 ms after
+`docker start`, and Docker reported it healthy about 550 ms after.
 
 Apps connect to `woc:6432` instead of `db:5432`. They can't keep using the container's own name:
 a stopped container drops out of Docker's DNS, and giving WOC the same alias would make DNS split
