@@ -6,7 +6,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A real Postgres for the NOTIFY test (notify_test.go).
+    # A real Postgres for the NOTIFY and SQL probe tests (notify_test.go, probe_test.go).
     services:
       postgres:
         image: postgres:18-alpine
@@ -27,6 +27,8 @@ jobs:
       - run: go test -race -count=1 ./...
       # Visible proof that NOTIFY was tested against the Postgres service, not skipped.
       - run: go test -count=1 -v -run TestNotifyWakesGroup ./... | tee /dev/stderr | grep -q -- '--- PASS'
+      # Same for the sql: work probe (and its read-only transaction).
+      - run: go test -count=1 -v -run TestSQLProbe ./... | tee /dev/stderr | grep -q -- '--- PASS'
       # Docker Hub's token endpoint sometimes answers 504; retry instead of failing the run.
       - name: docker build
         run: |

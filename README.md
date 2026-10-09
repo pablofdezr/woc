@@ -16,7 +16,7 @@ visitor gets an error. WOC keeps the route alive while the app sleeps, starts th
 request arrives, and stops it again after `woc.idle` with no requests and none in flight.
 
 It is one Go binary; its only dependency is [pgx](https://github.com/jackc/pgx), used just for
-the optional Postgres listener. The story behind it:
+the optional Postgres listener and SQL work probes. The story behind it:
 [Off Until Someone Asks](https://www.pablofr.com/blog/off-until-someone-asks).
 
 ## How a request is handled
@@ -55,6 +55,8 @@ services:
       woc.busy_url: http://:4100/busy # optional: 200 = busy, don't stop it yet
       woc.wake_every: 1h              # optional: wake it after this long asleep
       woc.wake_on_notify: jobs        # optional: Postgres NOTIFY channel(s) that wake it
+      woc.wake_when: sql:SELECT count(*) FROM jobs  # optional: a work probe checked while it sleeps
+      woc.wake_check_every: 30s       # optional: how often the probe runs (default 30s, at least 5s)
       woc.after: api                  # optional: start after these containers (compose depends_on is read on its own)
 ```
 
@@ -145,7 +147,7 @@ stopped ones wake on their next request.
 ## Apps that don't receive HTTP
 
 A queue worker never gets a request through WOC, so on its own WOC would put it to sleep and
-nothing would wake it, and it could stop it in the middle of a job. Four things cover that, and
+nothing would wake it, and it could stop it in the middle of a job. Five things cover that, and
 they combine:
 
 - **Wake from whoever enqueues:** `POST http://woc:8081/wake/<group>` starts the group (202 at
@@ -158,12 +160,50 @@ they combine:
 - **Wake on Postgres NOTIFY:** with `WOC_PG_URL` set, WOC LISTENs on every channel named in a
   `woc.wake_on_notify` label, so a queue that already runs `NOTIFY jobs` on enqueue wakes its
   worker with no change to the producer. It reconnects on its own if Postgres restarts.
+- **Ask the queue:** `woc.wake_when` is a work probe WOC runs every `woc.wake_check_every`
+  (default 30s, at least 5s) while the group sleeps, and wakes it when the probe says there is
+  work. For a producer you can't change and a queue that doesn't NOTIFY. See below.
 - **A safety net:** `woc.wake_every` wakes the group after it has been asleep that long, to drain
   anything that arrived without anyone telling WOC. The worker then sleeps again on its own
   idle rules.
 
 Put the worker in the same `woc.group` as the web app or API that feeds it and it also wakes with
 their traffic.
+
+### Work probes
+
+A probe takes one of three forms:
+
+```yaml
+# A query against the Postgres at WOC_PG_URL: one row, one column; true or a number above 0 = work
+woc.wake_when: "sql:SELECT count(*) FROM jobs WHERE state = 'queued'"
+
+# The length of a Redis list (a BullMQ wait list, an LPUSH queue): above 0 = work
+woc.wake_when: "redis://:password@redis:6379/0#bull:emails:wait"
+
+# Any HTTP endpoint: 200 = work, anything else = none
+woc.wake_when: "http://api:3000/jobs/pending"
+```
+
+- **sql:** runs in a read-only transaction (5 s timeout), so a probe can't write, and a fresh
+  connection each time, so a Postgres restart needs no reconnect logic. Give `WOC_PG_URL` a
+  read-only role anyway, with `SELECT` on the tables the probes read and nothing else.
+- **redis:** `redis://[user:password@]host:port[/db]#key`, `LLEN` of that key (2 s timeout).
+  Plain connections only; `rediss://` (TLS) is not supported.
+- **http, https:** a `GET` with a 3 s timeout.
+
+Probes run only while the group is asleep, never while it runs (the worker is draining the queue
+then), and never two at once for the same group. If several members of a group declare one, any
+of them reporting work wakes the group. A probe that fails (Postgres down, wrong password) counts
+as no work; WOC logs once when it starts failing and once when it recovers, and `/status` shows
+the last result (`probe`: `work`, `none` or `error: ...`, and `probe_at`). An invalid label is
+logged once and ignored.
+
+**The SQL probe must point at a database that is not itself asleep under WOC.** Each check would
+connect to it and wake it, every 30 s, and it would never sleep. For a queue in a database WOC
+manages, use NOTIFY instead: the producer's `NOTIFY` is what wakes the worker, and listening
+costs nothing as long as `WOC_PG_URL` points at the database container itself rather than WOC's
+TCP port. The same goes for an HTTP probe aimed at an app WOC puts to sleep.
 
 ## Run it
 
@@ -204,7 +244,7 @@ included. Treat WOC like any other component that can see the Docker API.
 | `WOC_NODE` | hostname | node name in the waiting page footer |
 | `WOC_BRAND` | `Wake On Call` | text before the node in the waiting page footer |
 | `WOC_ADMIN_TOKEN` | none | if set, `POST /wake/<group>` needs `Authorization: Bearer <token>` |
-| `WOC_PG_URL` | none | Postgres to LISTEN on for `woc.wake_on_notify` (off when empty) |
+| `WOC_PG_URL` | none | Postgres for `woc.wake_on_notify` (LISTEN) and `sql:` work probes (both off when empty); use a read-only role |
 | `WOC_STATE_FILE` | none | where holds are kept across restarts (put it on a volume) |
 
 ## The waiting page
@@ -239,7 +279,7 @@ docker logs woc                   # JSON lines: "woke" (with how long it took), 
 - **Public sites:** crawlers, monitors and link previews wake them constantly, and the first
   visitor after a quiet spell pays the start.
 - **Workers that can't say when they're needed:** a worker woken only by `woc.wake_every` picks
-  up work late. Wake it from the producer or from NOTIFY when you can.
+  up work late. Wake it from the producer, from NOTIFY or with a work probe when you can.
 - **Latency floors:** `docker start` itself is a few hundred milliseconds that no proxy removes.
 
 ## Related

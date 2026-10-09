@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,14 +68,17 @@ type group struct {
 	// sleep waits for the stop and then wakes it again, instead of racing it.
 	op sync.Mutex
 
-	mu        sync.Mutex
-	running   bool      // at least one member running (what the reaper stops)
-	ready     bool      // every member running and healthy: requests go straight through
-	inflight  int       // requests (and websockets) being proxied right now
-	lastSeen  time.Time // last request start or end
-	wokeAt    time.Time
-	sleptAt   time.Time // when it was last seen asleep after being up (or first seen asleep)
-	holdUntil time.Time // kept awake until then (woc hold), whatever the traffic
+	mu         sync.Mutex
+	running    bool      // at least one member running (what the reaper stops)
+	ready      bool      // every member running and healthy: requests go straight through
+	inflight   int       // requests (and websockets) being proxied right now
+	lastSeen   time.Time // last request start or end
+	wokeAt     time.Time
+	sleptAt    time.Time // when it was last seen asleep after being up (or first seen asleep)
+	holdUntil  time.Time // kept awake until then (woc hold), whatever the traffic
+	probe      probeState
+	probes     []probe       // woc.wake_when: checked while asleep, any reporting work wakes it
+	checkEvery time.Duration // woc.wake_check_every
 }
 
 func (g *group) touch(now time.Time) {
@@ -109,13 +113,17 @@ type engine struct {
 
 	stateFile    string               // where holds are kept across restarts ("" = memory only)
 	pendingHolds map[string]time.Time // restored holds waiting for their group's first sync
+
+	pgURL  string          // Postgres for sql: work probes (WOC_PG_URL)
+	warned map[string]bool // invalid labels already logged: sync runs every few seconds
 }
 
 func newEngine(d *docker, log *slog.Logger, defIdle time.Duration) *engine {
 	return &engine{d: d, log: log, now: time.Now, defIdle: defIdle, grace: 10 * time.Second,
 		addr:    func(m member) string { return net.JoinHostPort(m.name, strconv.Itoa(m.port)) },
 		tcpAddr: func(m member, port int) string { return net.JoinHostPort(m.name, strconv.Itoa(port)) },
-		groups:  map[string]*group{}, routes: map[string]route{}, tcpRoutes: map[int]tcpRoute{}}
+		groups:  map[string]*group{}, routes: map[string]route{}, tcpRoutes: map[int]tcpRoute{},
+		warned: map[string]bool{}}
 }
 
 func parseDur(s string, def time.Duration) time.Duration {
@@ -123,6 +131,15 @@ func parseDur(s string, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+// warnOnce logs a label problem the first time sync sees it, not on every sync.
+func (e *engine) warnOnce(key, msg string, args ...any) {
+	if e.warned[key] {
+		return
+	}
+	e.warned[key] = true
+	e.log.Warn(msg, args...)
 }
 
 func splitList(s string) []string {
@@ -151,6 +168,8 @@ func (e *engine) sync(ctx context.Context) error {
 		middlewares        []string
 		wakeEvery          time.Duration
 		channels           []string
+		probes             []probe
+		checkEvery         time.Duration // 0 = not set by any member
 		running, total     int
 	}
 	specs := map[string]*spec{}
@@ -202,6 +221,25 @@ func (e *engine) sync(ctx context.Context) error {
 				e.log.Warn("invalid woc.wake_on_notify channel, ignored", "container", m.name, "channel", ch)
 			}
 		}
+		if v := strings.TrimSpace(l[labelWakeWhen]); v != "" {
+			p, err := parseProbe(v)
+			if err == nil && p.kind == probeSQL && e.pgURL == "" {
+				err = errors.New("sql probes need WOC_PG_URL")
+			}
+			if err != nil {
+				e.warnOnce(m.name+"\x00"+v, "invalid woc.wake_when, ignored", "container", m.name, "err", err)
+			} else if !slices.ContainsFunc(s.probes, func(q probe) bool { return q.raw == p.raw }) {
+				s.probes = append(s.probes, p)
+			}
+		}
+		if v, ok := l[labelWakeCheckEvery]; ok {
+			// The most frequent check any member asks for wins, but never below the floor: each
+			// check is a connection to someone else's database or queue.
+			d := max(parseDur(v, defaultCheckEvery), minCheckEvery)
+			if s.checkEvery == 0 || d < s.checkEvery {
+				s.checkEvery = d
+			}
+		}
 		if len(m.hosts) > 0 {
 			p, err := strconv.Atoi(l[labelPort])
 			if err != nil || p <= 0 || p > 65535 {
@@ -243,7 +281,11 @@ func (e *engine) sync(ctx context.Context) error {
 		}
 		g.members, g.idle, g.startTimeout, g.middlewares = s.members, s.idle, s.startTimeout, dedupe(s.middlewares)
 		g.wakeEvery, g.channels = s.wakeEvery, dedupe(s.channels)
+		if s.checkEvery == 0 {
+			s.checkEvery = defaultCheckEvery
+		}
 		g.mu.Lock()
+		g.probes, g.checkEvery = s.probes, s.checkEvery // under g.mu: the probe ticker reads them
 		if s.running == 0 && g.sleptAt.IsZero() {
 			g.sleptAt = now // asleep when woc first sees it: wake_every counts from here
 		}
@@ -610,6 +652,8 @@ type groupStatus struct {
 	SleepsIn  string   `json:"sleeps_in,omitempty"`
 	HeldUntil string   `json:"held_until,omitempty"`
 	WokeAt    string   `json:"woke_at,omitempty"`
+	Probe     string   `json:"probe,omitempty"` // last woc.wake_when check: work, none or error: ...
+	ProbeAt   string   `json:"probe_at,omitempty"`
 }
 
 func (e *engine) status() []groupStatus {
@@ -634,6 +678,9 @@ func (e *engine) status() []groupStatus {
 		}
 		if !g.wokeAt.IsZero() {
 			s.WokeAt = g.wokeAt.UTC().Format(time.RFC3339)
+		}
+		if !g.probe.at.IsZero() {
+			s.Probe, s.ProbeAt = g.probe.result, g.probe.at.UTC().Format(time.RFC3339)
 		}
 		g.mu.Unlock()
 		out = append(out, s)

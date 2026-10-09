@@ -34,7 +34,7 @@ type config struct {
 	node                     string // waiting page footer: which server answered
 	brand                    string // waiting page footer: whose system this is
 	adminToken               string // if set, POST /wake needs "Authorization: Bearer <token>"
-	pgURL                    string // Postgres to LISTEN on for woc.wake_on_notify ("" = off)
+	pgURL                    string // Postgres for woc.wake_on_notify and sql: work probes ("" = off)
 	stateFile                string // holds survive restarts here ("" = memory only)
 	defaultIdle              time.Duration
 	syncEvery, reapEvery     time.Duration
@@ -89,6 +89,7 @@ func main() {
 	}
 	e := newEngine(d, log, cfg.defaultIdle)
 	e.stateFile = cfg.stateFile
+	e.pgURL = cfg.pgURL
 	e.loadHolds()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -102,6 +103,9 @@ func main() {
 		}
 	})
 	go every(ctx, cfg.reapEvery, func() { e.reap(ctx) })
+	// Work probes have their own interval per group (5 s at the least); a 1 s tick only looks at
+	// which are due, it starts no check by itself.
+	go every(ctx, time.Second, func() { e.probeDue(ctx) })
 	if cfg.pgURL != "" {
 		go e.listenPostgres(ctx, cfg.pgURL)
 	}
