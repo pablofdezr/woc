@@ -146,7 +146,7 @@ func (e *engine) proxyHandler(cfg config) http.Handler {
 		}
 		// The waiting page on demand, to see it without putting the app to sleep.
 		if r.URL.Path == "/.well-known/woc/preview" {
-			writeStartingPage(w, r, cfg.brand, cfg.node, uuidv7(e.now()))
+			writeStartingPage(w, r, http.StatusOK, cfg.brand, cfg.node, uuidv7(e.now()))
 			return
 		}
 		g := rt.group
@@ -186,7 +186,7 @@ func (e *engine) wakeFor(w http.ResponseWriter, r *http.Request, g *group, cfg c
 	case <-timer:
 		id := uuidv7(e.now())
 		e.log.Info("waiting page", "group", g.name, "request_id", id, "host", r.Host)
-		writeStartingPage(w, r, cfg.brand, cfg.node, id)
+		writeStartingPage(w, r, http.StatusServiceUnavailable, cfg.brand, cfg.node, id)
 		return errors.New("starting page served")
 	case <-r.Context().Done():
 		return r.Context().Err()

@@ -340,3 +340,11 @@ func TestReadyOnPortDoesNotWaitForHealthcheck(t *testing.T) {
 		t.Fatalf("wake took %s", d)
 	}
 }
+
+func TestPreviewIsOK(t *testing.T) {
+	h := newHarness(t, true, nil)
+	rec := h.get("/.well-known/woc/preview", "text/html")
+	if rec.Code != 200 || rec.Header().Get("Retry-After") != "" || !strings.Contains(rec.Body.String(), "waking up") {
+		t.Fatalf("preview: %d %q", rec.Code, rec.Header())
+	}
+}

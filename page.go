@@ -116,7 +116,8 @@ func uuidv7(now time.Time) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func writeStartingPage(w http.ResponseWriter, r *http.Request, brand, node, reqID string) {
+// writeStartingPage answers 503 + Retry-After while an app wakes, and 200 for the preview.
+func writeStartingPage(w http.ResponseWriter, r *http.Request, status int, brand, node, reqID string) {
 	lang := pickLang(r.Header.Get("Accept-Language"))
 	title := html.EscapeString(wakingUp[lang])
 	dir := "ltr"
@@ -127,10 +128,12 @@ func writeStartingPage(w http.ResponseWriter, r *http.Request, brand, node, reqI
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Content-Language", lang)
 	h.Set("Cache-Control", "no-store")
-	h.Set("Retry-After", "2")
+	if status == http.StatusServiceUnavailable {
+		h.Set("Retry-After", "2")
+	}
 	h.Set("Vary", "Accept-Language")
 	h.Set("X-Request-Id", reqID)
-	w.WriteHeader(http.StatusServiceUnavailable)
+	w.WriteHeader(status)
 	fmt.Fprintf(w, startingPage, lang, dir, title, title, html.EscapeString(brand), html.EscapeString(node), html.EscapeString(reqID))
 }
 
