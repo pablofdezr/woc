@@ -1,0 +1,5 @@
+# Add next to your existing providers (docker, file...) in Traefik's static configuration.
+providers:
+  http:
+    endpoint: http://woc:8081/traefik
+    pollInterval: 5s

@@ -1,0 +1,49 @@
+# woc next to Traefik. Traefik must share the `traefik` network with woc and with the apps,
+# and needs the HTTP provider (see traefik.yml in this folder).
+services:
+  # Two socket proxies on purpose. A single docker-socket-proxy can't allow "read, plus start and
+  # stop only": POST=1 with CONTAINERS=1 also allows create, delete and exec.
+  # Read: list and inspect containers, no writes.
+  dockerproxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.3
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [internal]
+
+  # Control: ONLY POST /containers/<id>/start and /stop. CONTAINERS=0 denies everything else.
+  dockerproxy-ctl:
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.3
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 0
+      POST: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [internal]
+
+  woc:
+    build: ..
+    container_name: woc
+    restart: unless-stopped
+    environment:
+      DOCKER_HOST: tcp://dockerproxy:2375
+      DOCKER_WRITE_HOST: tcp://dockerproxy-ctl:2375
+      WOC_SELF_URL: http://woc:8080
+      WOC_DEFAULT_IDLE: 30m
+      WOC_NODE: my-server
+      WOC_BRAND: Wake On Call
+    networks: [traefik, internal]
+    mem_limit: 64m
+
+networks:
+  traefik:
+    external: true
+  internal:
+    internal: true

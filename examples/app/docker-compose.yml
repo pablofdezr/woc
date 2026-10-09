@@ -1,0 +1,15 @@
+# An app that sleeps after 30 idle minutes. No traefik.* labels: woc publishes its router.
+services:
+  web:
+    image: nginx:alpine
+    restart: unless-stopped
+    networks: [traefik]
+    labels:
+      woc.enable: "true"
+      woc.host: app.example.com
+      woc.port: "80"
+      woc.idle: 30m
+
+networks:
+  traefik:
+    external: true
