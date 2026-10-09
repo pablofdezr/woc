@@ -107,6 +107,40 @@ func pickLang(accept string) string {
 
 // uuidv7 is time-ordered: the first 48 bits are Unix milliseconds, so ids sort by when the
 // request arrived and line up with the logs.
+// waitID is the request id shown on the waiting page. The page reloads every 2 s while the app
+// wakes, and each reload is a new request; a short-lived cookie keeps one id for the whole wait,
+// so the id a visitor reports matches one "waiting page" line in the log.
+func waitID(w http.ResponseWriter, r *http.Request, now time.Time) (id string, isNew bool) {
+	if c, err := r.Cookie(waitCookie); err == nil && validUUID(c.Value) {
+		return c.Value, false
+	}
+	id = uuidv7(now)
+	http.SetCookie(w, &http.Cookie{Name: waitCookie, Value: id, Path: "/", MaxAge: 60,
+		HttpOnly: true, Secure: r.Header.Get("X-Forwarded-Proto") == "https", SameSite: http.SameSiteLaxMode})
+	return id, true
+}
+
+const waitCookie = "woc_rid"
+
+func validUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func uuidv7(now time.Time) string {
 	var b [16]byte
 	_, _ = rand.Read(b[6:])
@@ -134,7 +168,12 @@ func writeStartingPage(w http.ResponseWriter, r *http.Request, status int, brand
 	h.Set("Vary", "Accept-Language")
 	h.Set("X-Request-Id", reqID)
 	w.WriteHeader(status)
-	fmt.Fprintf(w, startingPage, lang, dir, title, title, html.EscapeString(brand), html.EscapeString(node), html.EscapeString(reqID))
+	// While an app wakes, the page reloads itself until the app answers. The preview doesn't.
+	refresh := ""
+	if status == http.StatusServiceUnavailable {
+		refresh = `<meta http-equiv="refresh" content="2">`
+	}
+	fmt.Fprintf(w, startingPage, lang, dir, refresh, title, title, html.EscapeString(brand), html.EscapeString(node), html.EscapeString(reqID))
 }
 
 // Waiting page in the spirit of Vercel's checkpoint: one centred line and a monospace footer
@@ -144,7 +183,7 @@ const startingPage = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="2">
+%s
 <meta name="robots" content="noindex">
 <title>%s</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">

@@ -205,8 +205,10 @@ func (e *engine) wakeFor(w http.ResponseWriter, r *http.Request, g *group, cfg c
 		}
 		return err
 	case <-timer:
-		id := uuidv7(e.now())
-		e.log.Info("waiting page", "group", g.name, "request_id", id, "host", r.Host)
+		id, isNew := waitID(w, r, e.now())
+		if isNew { // one log line per wait, not one per reload
+			e.log.Info("waiting page", "group", g.name, "request_id", id, "host", r.Host)
+		}
 		writeStartingPage(w, r, http.StatusServiceUnavailable, cfg.brand, cfg.node, id)
 		return errors.New("starting page served")
 	case <-r.Context().Done():

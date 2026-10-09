@@ -495,3 +495,27 @@ func TestWakeStartsDependenciesFirst(t *testing.T) {
 		t.Fatalf("start order %v, want db before web", h.fd.order)
 	}
 }
+
+func TestWaitingPageKeepsOneIDAcrossReloads(t *testing.T) {
+	h := newHarness(t, false, map[string]string{labelReady: "healthy"})
+	h.fd.healthyLag = 1 << 30
+	first := h.get("/", "text/html")
+	cookie := first.Result().Cookies()
+	if first.Code != 503 || len(cookie) != 1 || cookie[0].Name != waitCookie || !strings.Contains(first.Body.String(), cookie[0].Value) {
+		t.Fatalf("first: %d %v", first.Code, cookie)
+	}
+	if !strings.Contains(first.Body.String(), `http-equiv="refresh"`) {
+		t.Fatal("the waiting page must reload itself")
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://app.test/", nil)
+	req.Header.Set("Accept", "text/html")
+	req.AddCookie(cookie[0])
+	rec := httptest.NewRecorder()
+	h.h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), cookie[0].Value) || len(rec.Result().Cookies()) != 0 {
+		t.Fatal("a reload must keep the same id")
+	}
+	if strings.Contains(h.get("/.well-known/woc/preview", "text/html").Body.String(), `http-equiv="refresh"`) {
+		t.Fatal("the preview must not reload")
+	}
+}
