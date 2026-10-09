@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -32,6 +33,8 @@ type config struct {
 	entryPoint, certResolver string
 	node                     string // waiting page footer: which server answered
 	brand                    string // waiting page footer: whose system this is
+	adminToken               string // if set, POST /wake needs "Authorization: Bearer <token>"
+	pgURL                    string // Postgres to LISTEN on for woc.wake_on_notify ("" = off)
 	defaultIdle              time.Duration
 	syncEvery, reapEvery     time.Duration
 	pageAfter                time.Duration // a browser waits this long before getting the "starting" page
@@ -55,6 +58,8 @@ func loadConfig() config {
 		certResolver: env("WOC_CERTRESOLVER", "le"),
 		node:         env("WOC_NODE", hostname()),
 		brand:        env("WOC_BRAND", "Wake On Call"),
+		adminToken:   os.Getenv("WOC_ADMIN_TOKEN"),
+		pgURL:        os.Getenv("WOC_PG_URL"),
 		defaultIdle:  parseDur(os.Getenv("WOC_DEFAULT_IDLE"), 30*time.Minute),
 		syncEvery:    parseDur(os.Getenv("WOC_SYNC_EVERY"), 5*time.Second),
 		reapEvery:    parseDur(os.Getenv("WOC_REAP_EVERY"), 15*time.Second),
@@ -90,6 +95,9 @@ func main() {
 		}
 	})
 	go every(ctx, cfg.reapEvery, func() { e.reap(ctx) })
+	if cfg.pgURL != "" {
+		go e.listenPostgres(ctx, cfg.pgURL)
+	}
 
 	proxy := &http.Server{Addr: cfg.listen, Handler: e.proxyHandler(cfg), ReadHeaderTimeout: 10 * time.Second}
 	admin := &http.Server{Addr: cfg.admin, Handler: e.adminHandler(cfg), ReadHeaderTimeout: 10 * time.Second}
@@ -116,6 +124,11 @@ func hostname() string {
 		return h
 	}
 	return "woc"
+}
+
+func tokenOK(header, token string) bool {
+	given := strings.TrimPrefix(header, "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(given), []byte(token)) == 1
 }
 
 func every(ctx context.Context, d time.Duration, f func()) {
@@ -227,6 +240,30 @@ func (e *engine) adminHandler(cfg config) http.Handler {
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(e.status())
+	})
+	// POST /wake/{group}: for apps that receive no HTTP from woc, e.g. a queue worker woken by
+	// whoever enqueues a job. 202 at once; ?wait=1 answers 200 once the group is ready.
+	mux.HandleFunc("POST /wake/{group}", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.adminToken != "" && !tokenOK(r.Header.Get("Authorization"), cfg.adminToken) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		g, ok := e.groupByName(r.PathValue("group"))
+		if !ok {
+			http.Error(w, "no such group", http.StatusNotFound)
+			return
+		}
+		g.touch(e.now())
+		if r.URL.Query().Get("wait") == "" {
+			e.wakeAsync(g, "wake endpoint")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if err := e.wake(r.Context(), g); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("GET /traefik", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -346,5 +347,97 @@ func TestPreviewIsOK(t *testing.T) {
 	rec := h.get("/.well-known/woc/preview", "text/html")
 	if rec.Code != 200 || rec.Header().Get("Retry-After") != "" || !strings.Contains(rec.Body.String(), "waking up") {
 		t.Fatalf("preview: %d %q", rec.Code, rec.Header())
+	}
+}
+
+func TestBusyURLPostponesSleep(t *testing.T) {
+	var busy atomic.Bool
+	busy.Store(true)
+	bs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if busy.Load() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(bs.Close)
+	h := newHarness(t, true, map[string]string{labelBusyURL: bs.URL + "/busy"})
+	h.clk.add(time.Hour)
+	h.e.reap(context.Background())
+	if _, st := h.fd.counts(); st != 0 {
+		t.Fatal("stopped a member that said it was busy")
+	}
+	busy.Store(false)
+	h.e.reap(context.Background()) // no extra idle window once the work is done
+	if _, st := h.fd.counts(); st != 1 {
+		t.Fatal("not stopped on the first reap after the work ended")
+	}
+}
+
+func TestWakeEndpoint(t *testing.T) {
+	h := newHarness(t, false, nil)
+	cfg := loadConfig()
+	cfg.adminToken = "s3cret"
+	admin := h.e.adminHandler(cfg)
+	post := func(path, auth string) int {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := post("/wake/web?wait=1", ""); c != http.StatusUnauthorized {
+		t.Fatalf("no token: %d", c)
+	}
+	if c := post("/wake/nope", "Bearer s3cret"); c != http.StatusNotFound {
+		t.Fatalf("unknown group: %d", c)
+	}
+	if c := post("/wake/web?wait=1", "Bearer s3cret"); c != http.StatusOK {
+		t.Fatalf("wake: %d", c)
+	}
+	if s, _ := h.fd.counts(); s != 1 {
+		t.Fatalf("starts=%d", s)
+	}
+}
+
+func TestWakeEvery(t *testing.T) {
+	h := newHarness(t, false, map[string]string{labelWakeEvery: "1h"})
+	h.clk.add(59 * time.Minute)
+	h.e.reap(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	if s, _ := h.fd.counts(); s != 0 {
+		t.Fatal("woken before wake_every")
+	}
+	h.clk.add(2 * time.Minute)
+	h.e.reap(context.Background())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, _ := h.fd.counts(); s == 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("not woken after wake_every")
+}
+
+func TestResolveBusyURLAndChannels(t *testing.T) {
+	for raw, want := range map[string]string{
+		"http://:4100/busy":   "http://worker:4100/busy",
+		"http://other:9000/x": "http://other:9000/x",
+		"http:///busy":        "http://worker/busy",
+	} {
+		if got, err := resolveBusyURL(raw, "worker"); err != nil || got != want {
+			t.Errorf("%s → %s %v, want %s", raw, got, err, want)
+		}
+	}
+	if _, err := resolveBusyURL("ftp://x/busy", "worker"); err == nil {
+		t.Error("ftp accepted")
+	}
+	for ch, ok := range map[string]bool{"jobs": true, "jobs_2": true, "2jobs": false, "jobs;drop": false, "": false, "Jobs": false} {
+		if validChannel(ch) != ok {
+			t.Errorf("validChannel(%q) != %v", ch, ok)
+		}
 	}
 }

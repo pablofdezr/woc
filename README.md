@@ -15,7 +15,8 @@ provider only sees running containers, so stopping an app also deletes its route
 visitor gets an error. WOC keeps the route alive while the app sleeps, starts the app when a
 request arrives, and stops it again after `woc.idle` with no requests and none in flight.
 
-It is one Go binary with no dependencies outside the standard library. The story behind it:
+It is one Go binary; its only dependency is [pgx](https://github.com/jackc/pgx), used just for
+the optional Postgres listener. The story behind it:
 [Off Until Someone Asks](https://www.pablofr.com/blog/off-until-someone-asks).
 
 ## How a request is handled
@@ -51,6 +52,9 @@ services:
       woc.middlewares: auth@file      # optional: Traefik middlewares for the router
       woc.start_timeout: 60s          # optional: how long a request waits for the wake
       woc.ready: port                 # optional: port (default) | healthy
+      woc.busy_url: http://:4100/busy # optional: 200 = busy, don't stop it yet
+      woc.wake_every: 1h              # optional: wake it after this long asleep
+      woc.wake_on_notify: jobs        # optional: Postgres NOTIFY channel(s) that wake it
 ```
 
 Containers without `woc.enable=true` are never touched. A group member without `woc.host`
@@ -59,6 +63,29 @@ Containers without `woc.enable=true` are never touched. A group member without `
 `woc.ready: port` treats the app as ready the moment its port accepts a connection (probed every
 25 ms). Use `woc.ready: healthy` for apps that open their port before they can really serve
 (migrations, cache warm-up): WOC then waits for the container's Docker healthcheck as well.
+
+## Apps that don't receive HTTP
+
+A queue worker never gets a request through WOC, so on its own WOC would put it to sleep and
+nothing would wake it, and it could stop it in the middle of a job. Four things cover that, and
+they combine:
+
+- **Wake from whoever enqueues:** `POST http://woc:8081/wake/<group>` starts the group (202 at
+  once, or 200 once it's ready with `?wait=1`). Your API calls it after it enqueues a job. Works
+  with any queue. Set `WOC_ADMIN_TOKEN` to require `Authorization: Bearer <token>`.
+- **Don't stop it mid-job:** `woc.busy_url` is checked before every stop. A `200` means busy, and
+  WOC asks again on the next reap without resetting the idle clock, so the worker sleeps within
+  `WOC_REAP_EVERY` of finishing. Any other answer, or none, means not busy. Leave the host out
+  (`http://:4100/busy`) and WOC fills in the container's name.
+- **Wake on Postgres NOTIFY:** with `WOC_PG_URL` set, WOC LISTENs on every channel named in a
+  `woc.wake_on_notify` label, so a queue that already runs `NOTIFY jobs` on enqueue wakes its
+  worker with no change to the producer. It reconnects on its own if Postgres restarts.
+- **A safety net:** `woc.wake_every` wakes the group after it has been asleep that long, to drain
+  anything that arrived without anyone telling WOC. The worker then sleeps again on its own
+  idle rules.
+
+Put the worker in the same `woc.group` as the web app or API that feeds it and it also wakes with
+their traffic.
 
 ## Run it
 
@@ -98,6 +125,8 @@ included. Treat WOC like any other component that can see the Docker API.
 | `WOC_REAP_EVERY` | `15s` | how often WOC looks for idle apps |
 | `WOC_NODE` | hostname | node name in the waiting page footer |
 | `WOC_BRAND` | `Wake On Call` | text before the node in the waiting page footer |
+| `WOC_ADMIN_TOKEN` | none | if set, `POST /wake/<group>` needs `Authorization: Bearer <token>` |
+| `WOC_PG_URL` | none | Postgres to LISTEN on for `woc.wake_on_notify` (off when empty) |
 
 ## The waiting page
 
@@ -120,7 +149,8 @@ putting an app to sleep.
 ```sh
 curl -s http://woc:8081/status    # each group: running, ready, in flight, time until it sleeps
 curl -s http://woc:8081/traefik   # the dynamic configuration Traefik polls
-docker logs woc                   # JSON lines: "woke" (with how long it took), "slept"
+curl -s -X POST http://woc:8081/wake/myapp?wait=1   # wake a group by hand
+docker logs woc                   # JSON lines: "woke" (with how long it took), "woken" (by whom), "slept"
 ```
 
 ## When not to use it
@@ -129,7 +159,8 @@ docker logs woc                   # JSON lines: "woke" (with how long it took), 
   isn't short, leave them running.
 - **Public sites:** crawlers, monitors and link previews wake them constantly, and the first
   visitor after a quiet spell pays the start.
-- **Queue workers:** they receive no HTTP request, so nothing would wake them.
+- **Workers that can't say when they're needed:** a worker woken only by `woc.wake_every` picks
+  up work late. Wake it from the producer or from NOTIFY when you can.
 - **Latency floors:** `docker start` itself is a few hundred milliseconds that no proxy removes.
 
 ## Related

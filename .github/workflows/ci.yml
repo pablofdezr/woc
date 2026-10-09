@@ -6,6 +6,17 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A real Postgres for the NOTIFY test (notify_test.go).
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: woc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      WOC_TEST_PG_URL: postgres://postgres:woc@localhost:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6

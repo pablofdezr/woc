@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +25,11 @@ const (
 	labelMiddlewares  = "woc.middlewares"   // Traefik middlewares for its router, e.g. cloudflare-only@file
 	labelStartTimeout = "woc.start_timeout" // how long a request waits for the wake (default 60s)
 	labelReady        = "woc.ready"         // "port" (default): ready once it accepts TCP; "healthy": wait for its healthcheck
+
+	// For apps that work without receiving HTTP (queue workers):
+	labelBusyURL    = "woc.busy_url"       // checked before a stop; 200 = busy, don't stop yet. Host may be empty: http://:4100/busy
+	labelWakeEvery  = "woc.wake_every"     // wake the group if it has been asleep this long (a safety net for missed work)
+	labelWakeNotify = "woc.wake_on_notify" // Postgres NOTIFY channel(s) that wake the group (needs WOC_PG_URL)
 )
 
 // member is one container of a group. Members without hosts (an internal API, a worker) start
@@ -32,6 +39,7 @@ type member struct {
 	hosts       []string
 	port        int
 	waitHealthy bool
+	busyURL     string // resolved: the container name filled in when the label leaves the host empty
 }
 
 // group is the unit that wakes and sleeps.
@@ -41,6 +49,8 @@ type group struct {
 	idle         time.Duration
 	startTimeout time.Duration
 	middlewares  []string
+	wakeEvery    time.Duration // 0 = off
+	channels     []string      // Postgres NOTIFY channels that wake it
 
 	// op serializes start and stop, so a request that arrives while the group is being put to
 	// sleep waits for the stop and then wakes it again, instead of racing it.
@@ -52,6 +62,7 @@ type group struct {
 	inflight int       // requests (and websockets) being proxied right now
 	lastSeen time.Time // last request start or end
 	wokeAt   time.Time
+	sleptAt  time.Time // when it was last seen asleep after being up (or first seen asleep)
 }
 
 func (g *group) touch(now time.Time) {
@@ -117,6 +128,8 @@ func (e *engine) sync(ctx context.Context) error {
 		members            []member
 		idle, startTimeout time.Duration // 0 = not set by any member
 		middlewares        []string
+		wakeEvery          time.Duration
+		channels           []string
 		running, total     int
 	}
 	specs := map[string]*spec{}
@@ -132,6 +145,24 @@ func (e *engine) sync(ctx context.Context) error {
 			specs[gname] = s
 		}
 		m := member{name: c.Name(), hosts: splitList(l[labelHost]), waitHealthy: strings.TrimSpace(l[labelReady]) == "healthy"}
+		if v := strings.TrimSpace(l[labelBusyURL]); v != "" {
+			u, err := resolveBusyURL(v, m.name)
+			if err != nil {
+				e.log.Warn("invalid woc.busy_url, ignored", "container", m.name, "url", v, "err", err)
+			} else {
+				m.busyURL = u
+			}
+		}
+		if v, ok := l[labelWakeEvery]; ok {
+			s.wakeEvery = max(s.wakeEvery, parseDur(v, 0))
+		}
+		for _, ch := range splitList(l[labelWakeNotify]) {
+			if validChannel(ch) {
+				s.channels = append(s.channels, ch)
+			} else {
+				e.log.Warn("invalid woc.wake_on_notify channel, ignored", "container", m.name, "channel", ch)
+			}
+		}
 		if len(m.hosts) > 0 {
 			p, err := strconv.Atoi(l[labelPort])
 			if err != nil || p <= 0 || p > 65535 {
@@ -171,7 +202,11 @@ func (e *engine) sync(ctx context.Context) error {
 			s.startTimeout = 60 * time.Second
 		}
 		g.members, g.idle, g.startTimeout, g.middlewares = s.members, s.idle, s.startTimeout, dedupe(s.middlewares)
+		g.wakeEvery, g.channels = s.wakeEvery, dedupe(s.channels)
 		g.mu.Lock()
+		if s.running == 0 && g.sleptAt.IsZero() {
+			g.sleptAt = now // asleep when woc first sees it: wake_every counts from here
+		}
 		if s.running > 0 && !g.running {
 			// Started from outside (deploy, CI, by hand): it gets a full idle window from now.
 			g.lastSeen = now
@@ -339,15 +374,10 @@ func dialOK(ctx context.Context, addr string) bool {
 
 // reap stops every group that has been idle longer than its window with nothing in flight.
 func (e *engine) reap(ctx context.Context) {
-	e.mu.RLock()
-	gs := make([]*group, 0, len(e.groups))
-	for _, g := range e.groups {
-		gs = append(gs, g)
-	}
-	e.mu.RUnlock()
-	for _, g := range gs {
+	for _, g := range e.snapshot() {
 		e.reapOne(ctx, g)
 	}
+	e.wakePeriodic()
 }
 
 func (e *engine) reapOne(ctx context.Context, g *group) {
@@ -355,15 +385,27 @@ func (e *engine) reapOne(ctx context.Context, g *group) {
 		return
 	}
 	defer g.op.Unlock()
+	if !e.idleNow(g) {
+		return
+	}
+	// A worker that says it is busy (woc.busy_url answering 200) is not stopped. Its clock is
+	// left alone, so it sleeps on the first reap after the work ends instead of a full idle
+	// window later.
+	for _, m := range g.members {
+		if m.busyURL != "" && e.busy(ctx, m.busyURL) {
+			e.log.Debug("busy, not stopping", "group", g.name, "container", m.name)
+			return
+		}
+	}
 	now := e.now()
 	g.mu.Lock()
 	idleFor := now.Sub(g.lastSeen)
-	if !g.running || g.inflight > 0 || idleFor < g.idle {
+	if !g.running || g.inflight > 0 || idleFor < g.idle { // a request arrived during the checks
 		g.mu.Unlock()
 		return
 	}
 	// From here new requests take the slow path and queue on g.op until the stop finishes.
-	g.ready, g.running = false, false
+	g.ready, g.running, g.sleptAt = false, false, now
 	g.mu.Unlock()
 	for _, m := range g.members {
 		if err := e.d.stop(ctx, m.name, e.grace); err != nil {
@@ -371,6 +413,109 @@ func (e *engine) reapOne(ctx context.Context, g *group) {
 		}
 	}
 	e.log.Info("slept", "group", g.name, "idle", idleFor.Round(time.Second).String())
+}
+
+func (e *engine) idleNow(g *group) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.running && g.inflight == 0 && e.now().Sub(g.lastSeen) >= g.idle
+}
+
+// busy asks a member whether it is in the middle of work: 200 means yes. Anything else, a
+// timeout or no answer at all means no: a worker that can't answer is not protected from sleep.
+func (e *engine) busy(ctx context.Context, url string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// resolveBusyURL fills in the container name when the label leaves the host out
+// (http://:4100/busy → http://worker:4100/busy).
+func resolveBusyURL(raw, container string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("scheme must be http or https")
+	}
+	if u.Hostname() == "" {
+		u.Host = net.JoinHostPort(container, u.Port())
+		if u.Port() == "" {
+			u.Host = container
+		}
+	}
+	return u.String(), nil
+}
+
+// wakeAsync starts a group in the background (wake endpoint, NOTIFY, wake_every).
+func (e *engine) wakeAsync(g *group, reason string) {
+	go func() {
+		if err := e.wake(context.Background(), g); err != nil {
+			e.log.Error("wake", "group", g.name, "reason", reason, "err", err)
+			return
+		}
+		e.log.Info("woken", "group", g.name, "reason", reason)
+	}()
+}
+
+// wakePeriodic wakes groups with woc.wake_every that have been asleep that long, so work that
+// arrived without anyone telling woc still gets picked up.
+func (e *engine) wakePeriodic() {
+	now := e.now()
+	for _, g := range e.snapshot() {
+		if g.wakeEvery == 0 {
+			continue
+		}
+		g.mu.Lock()
+		due := !g.running && !g.sleptAt.IsZero() && now.Sub(g.sleptAt) >= g.wakeEvery
+		if due {
+			g.sleptAt = now // one attempt per interval, even if the wake fails
+		}
+		g.mu.Unlock()
+		if due {
+			e.wakeAsync(g, "wake_every")
+		}
+	}
+}
+
+func (e *engine) snapshot() []*group {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	gs := make([]*group, 0, len(e.groups))
+	for _, g := range e.groups {
+		gs = append(gs, g)
+	}
+	return gs
+}
+
+func (e *engine) groupByName(name string) (*group, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	g, ok := e.groups[name]
+	return g, ok
+}
+
+// validChannel accepts plain Postgres identifiers only, so a label can't smuggle SQL into LISTEN.
+func validChannel(s string) bool {
+	if s == "" || len(s) > 63 {
+		return false
+	}
+	for i, r := range s {
+		if !(r == '_' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 type groupStatus struct {
