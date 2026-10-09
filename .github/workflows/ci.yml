@@ -14,4 +14,11 @@ jobs:
       - run: gofmt -l . | (! grep .)
       - run: go vet ./...
       - run: go test -race -count=1 ./...
-      - run: docker build -t woc .
+      # Docker Hub's token endpoint sometimes answers 504; retry instead of failing the run.
+      - name: docker build
+        run: |
+          for i in 1 2 3; do
+            docker build -t woc . && exit 0
+            echo "build failed (attempt $i), retrying in 20 s"; sleep 20
+          done
+          exit 1
