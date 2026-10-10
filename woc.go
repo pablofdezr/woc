@@ -26,6 +26,7 @@ const (
 	labelMiddlewares  = "woc.middlewares"   // Traefik middlewares for its router, e.g. cloudflare-only@file
 	labelStartTimeout = "woc.start_timeout" // how long a request waits for the wake (default 60s)
 	labelReady        = "woc.ready"         // "port" (default): ready once it accepts TCP; "healthy": wait for its healthcheck
+	labelQuietPaths   = "woc.quiet_paths"   // paths that don't count as activity (default /robots.txt,/sitemap.xml; "none" = all count)
 
 	// For apps that work without receiving HTTP (queue workers):
 	labelBusyURL    = "woc.busy_url"       // checked before a stop; 200 = busy, don't stop yet. Host may be empty: http://:4100/busy
@@ -79,6 +80,7 @@ type group struct {
 	probe      probeState
 	probes     []probe       // woc.wake_when: checked while asleep, any reporting work wakes it
 	checkEvery time.Duration // woc.wake_check_every
+	quietPaths []string      // requests that don't count as activity (crawlers' robots.txt, sitemaps)
 
 	// The last "is it still running?" asked to Docker after a failed proxy dial, reused for a
 	// second so a flood of failing requests costs one inspect, not one each.
@@ -123,8 +125,9 @@ type engine struct {
 	tcpBind string                          // address the TCP listeners bind to ("" = all)
 	tcpAddr func(m member, port int) string // where a member's TCP port is (tests use localhost)
 
-	stateFile    string               // where holds are kept across restarts ("" = memory only)
+	stateFile    string               // where holds and idle clocks are kept across restarts ("" = memory only)
 	pendingHolds map[string]time.Time // restored holds waiting for their group's first sync
+	pendingSeen  map[string]time.Time // restored last activity, same
 
 	pgURL  string          // Postgres for sql: work probes (WOC_PG_URL)
 	warned map[string]bool // invalid labels already logged: sync runs every few seconds
@@ -193,6 +196,8 @@ func (e *engine) sync(ctx context.Context) error {
 		channels           []string
 		probes             []probe
 		checkEvery         time.Duration // 0 = not set by any member
+		quietPaths         []string
+		quietSet           bool // some member set woc.quiet_paths
 		running, total     int
 	}
 	specs := map[string]*spec{}
@@ -279,6 +284,12 @@ func (e *engine) sync(ctx context.Context) error {
 			s.startTimeout = max(s.startTimeout, parseDur(v, 60*time.Second))
 		}
 		s.middlewares = append(s.middlewares, splitMiddlewares(l[labelMiddlewares])...)
+		if v, ok := l[labelQuietPaths]; ok {
+			s.quietSet = true
+			if strings.TrimSpace(v) != "none" {
+				s.quietPaths = append(s.quietPaths, splitList(v)...)
+			}
+		}
 		s.members = append(s.members, m)
 		s.total++
 		if c.State == "running" {
@@ -294,6 +305,12 @@ func (e *engine) sync(ctx context.Context) error {
 		g := e.groups[name]
 		if g == nil {
 			g = &group{name: name, lastSeen: now}
+			// Seen before this WOC restarted: keep its idle clock instead of a fresh window, or
+			// every WOC deploy would keep every app awake for another full idle period.
+			if t, ok := e.pendingSeen[name]; ok && s.running > 0 && !t.After(now) {
+				g.lastSeen, g.running = t, true
+			}
+			delete(e.pendingSeen, name)
 		}
 		sort.Slice(s.members, func(i, j int) bool { return s.members[i].name < s.members[j].name })
 		if s.idle == 0 {
@@ -303,6 +320,11 @@ func (e *engine) sync(ctx context.Context) error {
 			s.startTimeout = 60 * time.Second
 		}
 		g.members, g.idle, g.startTimeout, g.middlewares = s.members, s.idle, s.startTimeout, dedupe(s.middlewares)
+		if s.quietSet {
+			g.quietPaths = dedupe(s.quietPaths)
+		} else {
+			g.quietPaths = defaultQuietPaths
+		}
 		g.wakeEvery, g.channels = s.wakeEvery, dedupe(s.channels)
 		if s.checkEvery == 0 {
 			s.checkEvery = defaultCheckEvery
@@ -399,6 +421,47 @@ func (g *group) release(now time.Time) {
 	g.mu.Lock()
 	g.inflight--
 	g.lastSeen = now
+	g.mu.Unlock()
+}
+
+// defaultQuietPaths: what crawlers fetch on their own schedule. Served, but they don't keep an
+// app awake, or a site that only bots visit would never sleep.
+var defaultQuietPaths = []string{"/robots.txt", "/sitemap.xml"}
+
+// quietGrace is how long an app woken only by a quiet request stays up.
+const quietGrace = time.Minute
+
+func (g *group) quiet(path string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Contains(g.quietPaths, path)
+}
+
+// acquireQuiet / releaseQuiet: in flight like any request (a stop waits for it), but the idle
+// clock is left alone.
+func (g *group) acquireQuiet() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.ready {
+		return false
+	}
+	g.inflight++
+	return true
+}
+
+func (g *group) releaseQuiet() {
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+}
+
+// sleepSoon: woken only for a quiet request, it goes back to sleep after quietGrace unless real
+// traffic comes, instead of after a full idle window.
+func (g *group) sleepSoon(now time.Time) {
+	g.mu.Lock()
+	if soon := now.Add(quietGrace - g.idle); soon.Before(g.lastSeen) {
+		g.lastSeen = soon
+	}
 	g.mu.Unlock()
 }
 
@@ -538,6 +601,7 @@ func (e *engine) reap(ctx context.Context) {
 		e.reapOne(ctx, g)
 	}
 	e.wakePeriodic()
+	e.saveState() // and the idle clocks, so a WOC restart resumes them
 }
 
 func (e *engine) reapOne(ctx context.Context, g *group) {

@@ -30,6 +30,12 @@ the optional Postgres listener and SQL work probes. The story behind it:
   download or a websocket counts as activity until it closes), WOC runs `docker stop`.
 - **Started from outside** (a deploy, CI, by hand): the app gets a full idle window from the
   moment WOC notices, and sleeps even if nobody visits.
+- **WOC itself restarts:** with `WOC_STATE_FILE` set, each running app's last activity is saved
+  every reap and on shutdown, and the new WOC resumes those clocks instead of giving every app a
+  fresh idle window (otherwise a few WOC deploys in a row keep everything awake).
+- **Crawlers:** `/robots.txt` and `/sitemap.xml` are served but don't count as activity, so a
+  site only bots visit still sleeps. Asleep, the app is woken to answer and sleeps again a minute
+  later unless real traffic comes. `woc.quiet_paths` changes the list, `none` turns it off.
 - **Stopped from outside, or crashed:** the next request finds nothing listening. WOC checks with
   Docker and, if the container really stopped, wakes it and sends the request again, body
   included (streamed, never buffered), so the visitor never sees an error the app's client would
@@ -60,6 +66,7 @@ services:
       woc.middlewares: auth@file      # optional: Traefik middlewares for the router
       woc.start_timeout: 60s          # optional: how long a request waits for the wake
       woc.ready: port                 # optional: port (default) | healthy | postgres
+      woc.quiet_paths: /robots.txt    # optional: paths that don't count as activity (default /robots.txt,/sitemap.xml; none = all count)
       woc.busy_url: http://:4100/busy # optional: 200 = busy, don't stop it yet
       woc.wake_every: 1h              # optional: wake it after this long asleep
       woc.wake_on_notify: jobs        # optional: Postgres NOTIFY channel(s) that wake it
@@ -260,7 +267,7 @@ included. Treat WOC like any other component that can see the Docker API.
 | `WOC_BRAND` | `Wake On Call` | text before the node in the waiting page footer |
 | `WOC_ADMIN_TOKEN` | none | if set, `POST /wake/<group>` needs `Authorization: Bearer <token>` |
 | `WOC_PG_URL` | none | Postgres for `woc.wake_on_notify` (LISTEN) and `sql:` work probes (both off when empty); use a read-only role |
-| `WOC_STATE_FILE` | none | where holds are kept across restarts (put it on a volume) |
+| `WOC_STATE_FILE` | none | where holds and idle clocks are kept across restarts (put it on a volume) |
 
 ## The waiting page
 

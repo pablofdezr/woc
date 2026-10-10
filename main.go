@@ -82,7 +82,7 @@ func main() {
 	e := newEngine(d, log, cfg.defaultIdle)
 	e.stateFile = cfg.stateFile
 	e.pgURL = cfg.pgURL
-	e.loadHolds()
+	e.loadState()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -114,6 +114,7 @@ func main() {
 	}
 	log.Info("woc started", "proxy", cfg.listen, "admin", cfg.admin, "default_idle", cfg.defaultIdle.String())
 	<-ctx.Done()
+	e.saveState() // the idle clocks as of now, for the next WOC
 	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = proxy.Shutdown(sctx)
@@ -167,6 +168,10 @@ func (e *engine) proxyHandler(cfg config) http.Handler {
 			return
 		}
 		g := rt.group
+		if g.quiet(r.URL.Path) {
+			e.serveQuiet(w, r, rt, cfg)
+			return
+		}
 		if !g.acquire(e.now()) {
 			if err := e.wakeFor(w, r, g, cfg); err != nil {
 				return // wakeFor already answered
@@ -197,6 +202,25 @@ func (e *engine) proxyHandler(cfg config) http.Handler {
 		}
 		e.forward(w, r, rt, false, body)
 	})
+}
+
+// serveQuiet proxies a request that doesn't count as activity (robots.txt): awake, the idle
+// clock is left alone; asleep, the app is woken to answer it and sleeps again after quietGrace.
+func (e *engine) serveQuiet(w http.ResponseWriter, r *http.Request, rt route, cfg config) {
+	g := rt.group
+	if !g.acquireQuiet() {
+		if err := e.wakeFor(w, r, g, cfg); err != nil {
+			return
+		}
+		g.sleepSoon(e.now())
+		if !g.acquireQuiet() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "retry", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	defer g.releaseQuiet()
+	e.forward(w, r, rt, false, nil)
 }
 
 // replayableBody wraps a request body so a failed attempt leaves it reusable: the transport

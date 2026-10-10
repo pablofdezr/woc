@@ -13,9 +13,10 @@ import (
 // Holds keep a group awake for a while without traffic: a backup that runs `docker exec … pg_dump`
 // or pgBackRest against a database WOC would otherwise put to sleep. A hold wakes the group, and
 // until it expires the group is never stopped. Every hold expires on its own, so a backup that
-// dies without releasing it costs at most its duration. Holds are the one piece of state worth
-// keeping across a WOC restart (a long backup must not lose its database), so they are written
-// to a small JSON file when WOC_STATE_FILE is set.
+// dies without releasing it costs at most its duration. Holds are worth keeping across a WOC
+// restart (a long backup must not lose its database), and so is each running group's last
+// activity (a WOC deploy must not give every app a fresh idle window), so both are written to a
+// small JSON file when WOC_STATE_FILE is set.
 
 // hold sets (or extends, or with d == 0 releases) a group's hold, and persists the holds.
 func (e *engine) hold(g *group, d time.Duration) {
@@ -29,27 +30,30 @@ func (e *engine) hold(g *group, d time.Duration) {
 		g.lastSeen = e.now()
 	}
 	g.mu.Unlock()
-	e.saveHolds()
+	e.saveState()
 }
 
 func (g *group) held(now time.Time) bool {
 	return !g.holdUntil.IsZero() && now.Before(g.holdUntil)
 }
 
-func (e *engine) saveHolds() {
+func (e *engine) saveState() {
 	if e.stateFile == "" {
 		return
 	}
-	holds := map[string]time.Time{}
+	holds, seen := map[string]time.Time{}, map[string]time.Time{}
 	now := e.now()
 	for _, g := range e.snapshot() {
 		g.mu.Lock()
 		if g.held(now) {
 			holds[g.name] = g.holdUntil
 		}
+		if g.running {
+			seen[g.name] = g.lastSeen
+		}
 		g.mu.Unlock()
 	}
-	b, _ := json.MarshalIndent(map[string]any{"holds": holds}, "", "  ")
+	b, _ := json.MarshalIndent(map[string]any{"holds": holds, "last_seen": seen}, "", "  ")
 	tmp := e.stateFile + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(e.stateFile), 0o755); err == nil {
 		if err := os.WriteFile(tmp, b, 0o600); err == nil {
@@ -57,12 +61,12 @@ func (e *engine) saveHolds() {
 			return
 		}
 	}
-	e.log.Warn("could not save holds", "file", e.stateFile)
+	e.log.Warn("could not save state", "file", e.stateFile)
 }
 
-// loadHolds restores holds after a restart; groups appear on the first sync, so they are kept
+// loadState restores holds after a restart; groups appear on the first sync, so they are kept
 // aside until then.
-func (e *engine) loadHolds() {
+func (e *engine) loadState() {
 	if e.stateFile == "" {
 		return
 	}
@@ -71,10 +75,11 @@ func (e *engine) loadHolds() {
 		return
 	}
 	var st struct {
-		Holds map[string]time.Time `json:"holds"`
+		Holds    map[string]time.Time `json:"holds"`
+		LastSeen map[string]time.Time `json:"last_seen"`
 	}
 	if json.Unmarshal(b, &st) == nil {
-		e.pendingHolds = st.Holds
+		e.pendingHolds, e.pendingSeen = st.Holds, st.LastSeen
 	}
 }
 

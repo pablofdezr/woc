@@ -40,7 +40,7 @@ func TestHoldKeepsAwakeAndSurvivesRestart(t *testing.T) {
 	// A new engine (WOC restarted) reads the hold back from the state file.
 	e2 := newEngine(h.e.d, slog.New(slog.NewTextHandler(io.Discard, nil)), 30*time.Minute)
 	e2.now, e2.addr, e2.stateFile = h.clk.now, h.e.addr, state
-	e2.loadHolds()
+	e2.loadState()
 	if err := e2.refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
