@@ -25,6 +25,8 @@ import (
 //
 //	sql:SELECT count(*) FROM jobs WHERE state = 'queued'    → Postgres at WOC_PG_URL
 //	redis://:pass@redis:6379/0#bull:emails:wait             → LLEN of that list
+//	redis://:pass@redis:6379/0?due#app:wake_at              → members of that sorted set whose
+//	                                                          score (a time, Unix ms) has come
 //	http://api:3000/pending                                 → 200 = work
 const (
 	labelWakeWhen       = "woc.wake_when"
@@ -52,6 +54,7 @@ type probe struct {
 	addr, user, pass string
 	db               int
 	key              string
+	due              bool // ?due: a sorted set of times (Unix ms), work once one has come
 }
 
 // String is the probe as it can be logged: no passwords.
@@ -61,6 +64,9 @@ func (p probe) String() string {
 		return "sql"
 	case probeRedis:
 		u := url.URL{Scheme: "redis", Host: p.addr, Fragment: p.key}
+		if p.due {
+			u.RawQuery = "due"
+		}
 		if p.pass != "" {
 			u.User = url.UserPassword(p.user, "xxxxx")
 		}
@@ -108,6 +114,13 @@ func parseProbe(raw string) (probe, error) {
 		if u.User != nil {
 			p.user = u.User.Username()
 			p.pass, _ = u.User.Password()
+		}
+		switch u.RawQuery {
+		case "":
+		case "due":
+			p.due = true
+		default:
+			return p, fmt.Errorf("redis probe: unknown option %q (the only one is ?due)", u.RawQuery)
 		}
 		if db := strings.Trim(u.Path, "/"); db != "" {
 			n, err := strconv.Atoi(db)
@@ -294,8 +307,10 @@ func sqlTruthy(v any) (bool, error) {
 	return false, fmt.Errorf("query must return a boolean or a number, got %T", v)
 }
 
-// redisProbe asks Redis for the length of a list (a BullMQ wait list, a plain LPUSH queue). A
-// few lines of RESP instead of a client library: AUTH, SELECT and LLEN are all it needs.
+// redisProbe asks Redis for the length of a list (a BullMQ wait list, a plain LPUSH queue), or
+// with ?due how many members of a sorted set have a score (a time in Unix ms) that has come: a
+// sleeping worker's next cron, delayed jobs. A few lines of RESP instead of a client library:
+// AUTH, SELECT and LLEN or ZCOUNT are all it needs.
 func redisProbe(ctx context.Context, p probe) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -322,13 +337,17 @@ func redisProbe(ctx context.Context, p probe) (bool, error) {
 			return false, fmt.Errorf("SELECT: %w", err)
 		}
 	}
-	v, err := respCall(c, r, "LLEN", p.key)
+	cmd := []string{"LLEN", p.key}
+	if p.due {
+		cmd = []string{"ZCOUNT", p.key, "-inf", strconv.FormatInt(time.Now().UnixMilli(), 10)}
+	}
+	v, err := respCall(c, r, cmd...)
 	if err != nil {
-		return false, fmt.Errorf("LLEN: %w", err)
+		return false, fmt.Errorf("%s: %w", cmd[0], err)
 	}
 	n, ok := v.(int64)
 	if !ok {
-		return false, fmt.Errorf("LLEN: unexpected reply %v", v)
+		return false, fmt.Errorf("%s: unexpected reply %v", cmd[0], v)
 	}
 	return n > 0, nil
 }

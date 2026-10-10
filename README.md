@@ -189,6 +189,9 @@ woc.wake_when: "sql:SELECT count(*) FROM jobs WHERE state = 'queued'"
 # The length of a Redis list (a BullMQ wait list, an LPUSH queue): above 0 = work
 woc.wake_when: "redis://:password@redis:6379/0#bull:emails:wait"
 
+# A Redis sorted set of times (Unix ms): work once one of them has come
+woc.wake_when: "redis://:password@redis:6379/0?due#app:wake_at"
+
 # Any HTTP endpoint: 200 = work, anything else = none
 woc.wake_when: "http://api:3000/jobs/pending"
 ```
@@ -197,7 +200,11 @@ woc.wake_when: "http://api:3000/jobs/pending"
   connection each time, so a Postgres restart needs no reconnect logic. Give `WOC_PG_URL` a
   read-only role anyway, with `SELECT` on the tables the probes read and nothing else.
 - **redis:** `redis://[user:password@]host:port[/db]#key`, `LLEN` of that key (2 s timeout).
-  Plain connections only; `rediss://` (TLS) is not supported.
+  With `?due`, `ZCOUNT key -inf <now>` instead: the key is a sorted set whose scores are times
+  in Unix milliseconds, and there is work once one of them has come. That's how a worker with
+  crons sleeps: before going idle it writes when it next needs to run (`ZADD app:wake_at <ms>
+  next`), and WOC wakes it then, give or take `woc.wake_check_every`. Plain connections only;
+  `rediss://` (TLS) is not supported.
 - **http, https:** a `GET` with a 3 s timeout.
 
 Probes run only while the group is asleep, never while it runs (the worker is draining the queue

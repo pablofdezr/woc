@@ -61,6 +61,7 @@ type fakeRedis struct {
 	pass  string
 	mu    sync.Mutex
 	lists map[int]map[string]int // db → key → length
+	zsets map[string][]int64     // key → scores (db 0)
 	cmds  []string
 }
 
@@ -112,6 +113,21 @@ func (f *fakeRedis) handle(c net.Conn) {
 			}
 			f.mu.Lock()
 			n := f.lists[db][args[1]]
+			f.mu.Unlock()
+			fmt.Fprintf(c, ":%d\r\n", n)
+		case "ZCOUNT":
+			if !authed {
+				fmt.Fprint(c, "-NOAUTH Authentication required.\r\n")
+				continue
+			}
+			max, _ := strconv.ParseInt(args[3], 10, 64)
+			n := 0
+			f.mu.Lock()
+			for _, sc := range f.zsets[args[1]] {
+				if sc <= max {
+					n++
+				}
+			}
 			f.mu.Unlock()
 			fmt.Fprintf(c, ":%d\r\n", n)
 		default:
@@ -170,6 +186,33 @@ func TestRedisProbe(t *testing.T) {
 	defer f.mu.Unlock()
 	if strings.Join(f.cmds[:3], " ") != "AUTH SELECT LLEN" {
 		t.Fatalf("commands %v", f.cmds)
+	}
+}
+
+// ?due: a sorted set of times. Work once one of them has come, none while all are ahead.
+func TestRedisDueProbe(t *testing.T) {
+	now := time.Now().UnixMilli()
+	f := &fakeRedis{zsets: map[string][]int64{
+		"app:wake_at":  {now + 3_600_000, now - 1000}, // one due a second ago
+		"app:later":    {now + 60_000},
+		"app:empty_at": nil,
+	}}
+	addr := f.serve(t)
+	for key, want := range map[string]bool{"app:wake_at": true, "app:later": false, "app:empty_at": false} {
+		p, err := parseProbe("redis://" + addr + "?due#" + key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if work, err := redisProbe(context.Background(), p); err != nil || work != want {
+			t.Fatalf("%s: work=%v err=%v, want %v", key, work, err, want)
+		}
+	}
+	if _, err := parseProbe("redis://" + addr + "?soon#k"); err == nil {
+		t.Fatal("unknown option accepted")
+	}
+	p, _ := parseProbe("redis://:pw@" + addr + "?due#app:wake_at")
+	if s := p.String(); strings.Contains(s, "pw") || !strings.Contains(s, "?due#app:wake_at") {
+		t.Fatalf("String() = %q", s)
 	}
 }
 
