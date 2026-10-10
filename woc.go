@@ -89,6 +89,7 @@ func (g *group) touch(now time.Time) {
 
 type route struct {
 	group  *group
+	member string // the container serving it
 	target string // host:port on the shared docker network
 }
 
@@ -305,7 +306,7 @@ func (e *engine) sync(ctx context.Context) error {
 					e.log.Warn("duplicate host, keeping the first", "host", h, "group", prev.group.name, "ignored", name)
 					continue
 				}
-				routes[h] = route{group: g, target: e.addr(m)}
+				routes[h] = route{group: g, member: m.name, target: e.addr(m)}
 			}
 			for _, t := range m.tcp {
 				if prev, dup := tcpRoutes[t.listen]; dup {

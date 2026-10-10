@@ -30,6 +30,10 @@ the optional Postgres listener and SQL work probes. The story behind it:
   download or a websocket counts as activity until it closes), WOC runs `docker stop`.
 - **Started from outside** (a deploy, CI, by hand): the app gets a full idle window from the
   moment WOC notices, and sleeps even if nobody visits.
+- **Stopped from outside, or crashed:** the next request finds nothing listening. WOC checks with
+  Docker, wakes the app and sends the request again, so the visitor never sees a 502. Only a
+  request without a body can be sent twice; one with a body (a form POST) gets a `503` with
+  `Retry-After: 1` while the app starts.
 
 Measured on a 4 vCPU Hetzner box with a small Node app: `docker start` takes about 230 ms and the
 app listens about 150 ms later, so a cold request costs roughly a quarter to half a second more

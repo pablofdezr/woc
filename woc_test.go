@@ -25,6 +25,7 @@ type fakeDocker struct {
 	stops      int
 	order      []string // container names in the order they were started
 	healthyLag int      // inspections a started container reports "starting" before "healthy"
+	onStart    func(name string)
 }
 
 type fakeContainer struct {
@@ -77,6 +78,9 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.running, c.untilOK = true, f.healthyLag
 			f.starts++
 			f.order = append(f.order, parts[0])
+			if f.onStart != nil {
+				f.onStart(parts[0])
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case "stop":
 			c.running = false

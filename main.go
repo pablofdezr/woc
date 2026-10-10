@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -188,8 +189,30 @@ func (e *engine) proxyHandler(cfg config) http.Handler {
 		// A closure: the clock must be read when the request ENDS (a long download or a
 		// websocket counts as activity until it closes), not when the defer is set up.
 		defer func() { g.release(e.now()) }()
-		e.forward(w, r, rt)
+		if !e.forward(w, r, rt, true) {
+			return
+		}
+		// The app wasn't there although woc thought it was awake: it crashed, or someone
+		// stopped it from outside. Wake it and send the request again (only requests without a
+		// body, which can be replayed), instead of a 502 the visitor would have to retry by hand.
+		e.log.Info("app gone, waking", "group", g.name, "target", rt.target)
+		if err := e.wakeFor(w, r, g, cfg); err != nil {
+			return // wakeFor already answered
+		}
+		e.forward(w, r, rt, false)
 	})
+}
+
+// appGone: the proxy failed because the container isn't running (it crashed, or was stopped
+// from outside), rather than because a running app misbehaved. The connection may fail either
+// way: refused, no such host once Docker's DNS drops it, or a pooled connection that died with it.
+func (e *engine) appGone(ctx context.Context, rt route, err error) bool {
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return true
+	}
+	st, ierr := e.d.inspect(ctx, rt.member)
+	return ierr == nil && !st.Running
 }
 
 // wakeFor wakes the group for this request. A browser navigation that is still waiting after
@@ -220,7 +243,11 @@ func (e *engine) wakeFor(w http.ResponseWriter, r *http.Request, g *group, cfg c
 	}
 }
 
-func (e *engine) forward(w http.ResponseWriter, r *http.Request, rt route) {
+// forward proxies the request to the app. It returns true, having written nothing, when the app
+// is gone and the request can be sent again once it's awake (retry allowed and no body, since
+// the transport has consumed or closed it by then).
+func (e *engine) forward(w http.ResponseWriter, r *http.Request, rt route, retry bool) (gone bool) {
+	retry = retry && (r.Body == nil || r.Body == http.NoBody)
 	target := &url.URL{Scheme: "http", Host: rt.target}
 	p := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -237,15 +264,28 @@ func (e *engine) forward(w http.ResponseWriter, r *http.Request, rt route) {
 		},
 		FlushInterval: -1, // SSE / streaming answers go out as they are written
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			// The container went away under us (crash, someone stopped it): the next request
-			// re-checks and wakes it again.
+			// The container went away under us (crash, someone stopped it): mark it down so the
+			// next wake re-checks it.
 			rt.group.markDown()
+			if e.appGone(context.WithoutCancel(r.Context()), rt, err) {
+				if retry {
+					gone = true
+					return
+				}
+				// A request with a body can't be replayed: wake the app now so the client's
+				// retry finds it up, and tell it to retry.
+				e.wakeAsync(rt.group, "proxy dial failed")
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "the app is starting", http.StatusServiceUnavailable)
+				return
+			}
 			e.log.Warn("proxy", "group", rt.group.name, "target", rt.target, "err", err)
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "the app is not responding", http.StatusBadGateway)
 		},
 	}
 	p.ServeHTTP(w, r)
+	return gone
 }
 
 func (e *engine) adminHandler(cfg config) http.Handler {
