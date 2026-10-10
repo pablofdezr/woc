@@ -26,6 +26,7 @@ type fakeDocker struct {
 	order      []string // container names in the order they were started
 	healthyLag int      // inspections a started container reports "starting" before "healthy"
 	onStart    func(name string)
+	inspects   int
 }
 
 type fakeContainer struct {
@@ -59,6 +60,7 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch parts[1] {
 		case "json":
+			f.inspects++
 			st := containerState{Running: c.running}
 			if c.hasHealth {
 				st.Health = &struct {

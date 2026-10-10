@@ -1,13 +1,3 @@
-// woc ("wake on call") keeps opted-in apps stopped while nobody uses them and starts them on
-// the first request.
-//
-//	browser ─▶ Traefik ─▶ woc :8080 ─▶ app container (started on demand)
-//	           ▲
-//	           └─ routers from woc :8081/traefik (HTTP provider), built from container labels
-//
-// An app opts in with labels (see woc.go) and WITHOUT traefik.* labels: a stopped container
-// disappears from Traefik's docker provider, so its router has to live somewhere that is always
-// up — here. After woc.idle (default 30m) with no requests and none in flight, woc stops it.
 package main
 
 import (
@@ -15,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -189,31 +180,78 @@ func (e *engine) proxyHandler(cfg config) http.Handler {
 		// A closure: the clock must be read when the request ENDS (a long download or a
 		// websocket counts as activity until it closes), not when the defer is set up.
 		defer func() { g.release(e.now()) }()
-		if !e.forward(w, r, rt, true) {
+		var body *replayableBody
+		if r.Body != nil && r.Body != http.NoBody {
+			body = &replayableBody{r: r.Body}
+			r.Body = body
+		}
+		if !e.forward(w, r, rt, true, body) {
 			return
 		}
 		// The app wasn't there although woc thought it was awake: it crashed, or someone
-		// stopped it from outside. Wake it and send the request again (only requests without a
-		// body, which can be replayed), instead of a 502 the visitor would have to retry by hand.
+		// stopped it from outside. Nothing reached it, so wake it and send the request again,
+		// body included, instead of an error the app's client may never retry.
 		e.log.Info("app gone, waking", "group", g.name, "target", rt.target)
 		if err := e.wakeFor(w, r, g, cfg); err != nil {
 			return // wakeFor already answered
 		}
-		e.forward(w, r, rt, false)
+		e.forward(w, r, rt, false, body)
 	})
 }
 
-// appGone: the proxy failed because the container isn't running (it crashed, or was stopped
-// from outside), rather than because a running app misbehaved. The connection may fail either
-// way: refused, no such host once Docker's DNS drops it, or a pooled connection that died with it.
-func (e *engine) appGone(ctx context.Context, rt route, err error) bool {
-	var op *net.OpError
-	if errors.As(err, &op) && op.Op == "dial" {
-		return true
-	}
-	st, ierr := e.d.inspect(ctx, rt.member)
-	return ierr == nil && !st.Running
+// replayableBody wraps a request body so a failed attempt leaves it reusable: the transport
+// closes the body when a request fails, which would lose it. Nothing is buffered: the body is
+// streamed once, to whichever attempt reaches the app. read is a guard: a body that was read
+// from can't be sent again.
+type replayableBody struct {
+	r    io.ReadCloser
+	read bool
 }
+
+func (b *replayableBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if n > 0 {
+		b.read = true
+	}
+	return n, err
+}
+
+func (b *replayableBody) Close() error { return nil } // the server closes the real body
+
+// containerStopped asks Docker whether the app's container has stopped (crashed, or stopped
+// from outside) after the proxy failed to reach it. A live app that merely refuses or drops
+// connections (overloaded, restarting its listener) is NOT stopped: it gets a 502 at once, and
+// isn't marked down, since then every request would wait out a wake for an app that's already
+// up, and anyone could pile them up. The answer is reused for a second, so a flood of failing
+// requests costs one inspect, not one each.
+func (e *engine) containerStopped(ctx context.Context, rt route) bool {
+	g := rt.group
+	g.goneMu.Lock()
+	defer g.goneMu.Unlock()
+	if now := e.now(); now.Sub(g.goneChecked) >= time.Second || now.Before(g.goneChecked) {
+		st, err := e.d.inspect(ctx, rt.member)
+		g.goneChecked, g.goneStopped = now, err == nil && !st.Running
+	}
+	return g.goneStopped
+}
+
+// isDialError: the connection to the app was never opened, so the app can't have seen any of
+// the request, and sending it again can't run a POST twice.
+func isDialError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
+// woc ("wake on call") keeps opted-in apps stopped while nobody uses them and starts them on
+// the first request.
+//
+//	browser ─▶ Traefik ─▶ woc :8080 ─▶ app container (started on demand)
+//	           ▲
+//	           └─ routers from woc :8081/traefik (HTTP provider), built from container labels
+//
+// An app opts in with labels (see woc.go) and WITHOUT traefik.* labels: a stopped container
+// disappears from Traefik's docker provider, so its router has to live somewhere that is always
+// up — here. After woc.idle (default 30m) with no requests and none in flight, woc stops it.
 
 // wakeFor wakes the group for this request. A browser navigation that is still waiting after
 // cfg.pageAfter gets the "starting" page (the wake carries on in the background).
@@ -243,11 +281,11 @@ func (e *engine) wakeFor(w http.ResponseWriter, r *http.Request, g *group, cfg c
 	}
 }
 
-// forward proxies the request to the app. It returns true, having written nothing, when the app
-// is gone and the request can be sent again once it's awake (retry allowed and no body, since
-// the transport has consumed or closed it by then).
-func (e *engine) forward(w http.ResponseWriter, r *http.Request, rt route, retry bool) (gone bool) {
-	retry = retry && (r.Body == nil || r.Body == http.NoBody)
+// forward proxies the request to the app. On a first attempt (retry) it returns true, having
+// written nothing, when the app turns out to be gone and nothing of the request reached it: the
+// caller wakes the app and sends it again. A request with a body goes over a fresh connection,
+// so a gone app fails at the dial, before the body is read, and the body is still whole.
+func (e *engine) forward(w http.ResponseWriter, r *http.Request, rt route, retry bool, body *replayableBody) (gone bool) {
 	target := &url.URL{Scheme: "http", Host: rt.target}
 	p := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -265,24 +303,21 @@ func (e *engine) forward(w http.ResponseWriter, r *http.Request, rt route, retry
 		FlushInterval: -1, // SSE / streaming answers go out as they are written
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// The container went away under us (crash, someone stopped it): mark it down so the
-			// next wake re-checks it.
-			rt.group.markDown()
-			if e.appGone(context.WithoutCancel(r.Context()), rt, err) {
-				if retry {
+			// next request wakes it, and send this one again if it never reached the app.
+			if e.containerStopped(context.WithoutCancel(r.Context()), rt) {
+				rt.group.markDown()
+				if retry && isDialError(err) && (body == nil || !body.read) {
 					gone = true
 					return
 				}
-				// A request with a body can't be replayed: wake the app now so the client's
-				// retry finds it up, and tell it to retry.
-				e.wakeAsync(rt.group, "proxy dial failed")
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, "the app is starting", http.StatusServiceUnavailable)
-				return
 			}
 			e.log.Warn("proxy", "group", rt.group.name, "target", rt.target, "err", err)
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "the app is not responding", http.StatusBadGateway)
 		},
+	}
+	if body != nil {
+		p.Transport = e.fresh
 	}
 	p.ServeHTTP(w, r)
 	return gone

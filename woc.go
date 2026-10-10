@@ -79,6 +79,17 @@ type group struct {
 	probe      probeState
 	probes     []probe       // woc.wake_when: checked while asleep, any reporting work wakes it
 	checkEvery time.Duration // woc.wake_check_every
+
+	// The last "is it still running?" asked to Docker after a failed proxy dial, reused for a
+	// second so a flood of failing requests costs one inspect, not one each.
+	goneMu      sync.Mutex
+	goneChecked time.Time
+	goneStopped bool
+
+	// The last wake that failed: requests queued behind it share its error instead of each
+	// waiting out a whole start timeout again, one after another.
+	wakeErr   error
+	wakeErrAt time.Time
 }
 
 func (g *group) touch(now time.Time) {
@@ -117,6 +128,11 @@ type engine struct {
 
 	pgURL  string          // Postgres for sql: work probes (WOC_PG_URL)
 	warned map[string]bool // invalid labels already logged: sync runs every few seconds
+
+	// fresh opens a new connection per request: used for requests with a body, so an app that
+	// went away fails at the dial, before a byte of the body is read, and the request can be
+	// sent again untouched. A pooled connection to a dead container would fail mid-write instead.
+	fresh http.RoundTripper
 }
 
 func newEngine(d *docker, log *slog.Logger, defIdle time.Duration) *engine {
@@ -124,7 +140,13 @@ func newEngine(d *docker, log *slog.Logger, defIdle time.Duration) *engine {
 		addr:    func(m member) string { return net.JoinHostPort(m.name, strconv.Itoa(m.port)) },
 		tcpAddr: func(m member, port int) string { return net.JoinHostPort(m.name, strconv.Itoa(port)) },
 		groups:  map[string]*group{}, routes: map[string]route{}, tcpRoutes: map[int]tcpRoute{},
-		warned: map[string]bool{}}
+		warned: map[string]bool{}, fresh: freshTransport()}
+}
+
+func freshTransport() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DisableKeepAlives = true
+	return t
 }
 
 func parseDur(s string, def time.Duration) time.Duration {
@@ -391,15 +413,31 @@ var errWakeTimeout = errors.New("the app did not start in time")
 // wake starts every stopped member and waits until all are ready (healthy if they declare a
 // healthcheck, accepting TCP on their port if they serve traffic). Concurrent callers share
 // one wake through g.op.
-func (e *engine) wake(ctx context.Context, g *group) error {
+func (e *engine) wake(ctx context.Context, g *group) (err error) {
+	asked := time.Now() // wall clock: ordering against wakeErrAt, not the (test) engine clock
 	g.op.Lock()
 	defer g.op.Unlock()
 	g.mu.Lock()
 	ready := g.ready
+	if !ready && g.wakeErr != nil && g.wakeErrAt.After(asked) {
+		// A wake failed while this caller was waiting for the lock: same answer, no second wait.
+		err := g.wakeErr
+		g.mu.Unlock()
+		return err
+	}
 	g.mu.Unlock()
 	if ready {
 		return nil
 	}
+	defer func() {
+		g.mu.Lock()
+		if err != nil {
+			g.wakeErr, g.wakeErrAt = err, time.Now()
+		} else {
+			g.wakeErr = nil
+		}
+		g.mu.Unlock()
+	}()
 	t0 := e.now()
 	ctx, cancel := context.WithTimeout(ctx, g.startTimeout)
 	defer cancel()

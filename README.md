@@ -31,9 +31,13 @@ the optional Postgres listener and SQL work probes. The story behind it:
 - **Started from outside** (a deploy, CI, by hand): the app gets a full idle window from the
   moment WOC notices, and sleeps even if nobody visits.
 - **Stopped from outside, or crashed:** the next request finds nothing listening. WOC checks with
-  Docker, wakes the app and sends the request again, so the visitor never sees a 502. Only a
-  request without a body can be sent twice; one with a body (a form POST) gets a `503` with
-  `Retry-After: 1` while the app starts.
+  Docker and, if the container really stopped, wakes it and sends the request again, body
+  included (streamed, never buffered), so the visitor never sees an error the app's client would
+  have to retry. Only a request that never reached the app is sent again (the connection to it
+  failed to open; requests with a body use a fresh connection for that), so a POST can't run
+  twice. A live app that refuses connections is not woken or waited for: it answers 502 at once,
+  and Docker is asked at most once a second however many requests fail. Requests queued behind a
+  wake that fails share its error instead of each waiting out the start timeout again.
 
 Measured on a 4 vCPU Hetzner box with a small Node app: `docker start` takes about 230 ms and the
 app listens about 150 ms later, so a cold request costs roughly a quarter to half a second more
